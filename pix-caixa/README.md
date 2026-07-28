@@ -50,7 +50,7 @@ PAINEL_SENHA=<senha do painel>
 SENHA_BRUTOS=<segunda senha, só pra aba de não reconhecidas>
 N8N_WEBHOOK_URL=<url do webhook do n8n — pode deixar vazio por enquanto>
 DB_PATH=/data/pix.db
-LIMITE_HEARTBEAT_MIN=25
+LIMITE_HEARTBEAT_MIN=60
 HORA_LIMPEZA=2
 ```
 
@@ -133,8 +133,8 @@ confirmar vira Pix recebido. Promoção, Pix enviado e fatura vão pra `/brutos`
 - **Cabeçalho:** `X-Ingest-Token: SEU_TOKEN`
 - **Corpo:** vazio
 
-Sem isso você não descobre que a ponte morreu. Com isso, o painel mostra faixa
-vermelha em até 25 minutos.
+Sem isso o relógio de "Última atualização" no painel para de andar e você não
+tem como saber se o silêncio é falta de venda ou ponte morta.
 
 ---
 
@@ -207,8 +207,8 @@ navegador"* — qualquer toque na tela destrava. O painel checa esse estado a ca
 depender de alguém testar.
 
 > O teste de som **não** verifica se o celular está entregando os Pix. Quem faz
-> isso é o indicador de ponte (a bolinha e o "Sem sinal há X min"), que checa
-> sozinho a cada 10 minutos. São dois problemas diferentes.
+> isso é a linha "Última atualização há X", que anda sozinha a cada 10 minutos.
+> São dois problemas diferentes.
 
 ---
 
@@ -227,7 +227,7 @@ anterior. Se aparecer um formato novo de notificação, copie o texto de `/bruto
 **no mesmo dia** — às 2h ele vai embora.
 
 O `heartbeat` sobrevive à limpeza. Ele é status da ponte, não dado de cliente, e
-zerá-lo faria o painel acusar "ponte offline" sem motivo.
+zerá-lo faria o painel abrir toda manhã dizendo "há mais de um dia" sem motivo.
 
 Se o container estiver fora do ar às 2h, a limpeza roda assim que ele subir —
 não é pulada em silêncio. Rodando com dois workers do gunicorn, só um apaga: o
@@ -261,7 +261,13 @@ Ela é guardada e fica visível, mas não aparece como Pix confirmado no painel.
 app do MP em caso de dúvida ou valor alto — mantenha esse texto.
 
 **Canal único.** Se o celular desligar, travar ou perder o wi-fi, para tudo. O
-heartbeat avisa em até 25 min, e o arquivo local guarda o que não foi enviado.
+arquivo local guarda o que não foi enviado.
+
+**O painel não grita.** Por decisão de projeto não existe faixa de alarme nem
+aviso de "ponte offline": a única pista de que o celular parou é a linha
+**"Última atualização há X"**, que fica verde e vira âmbar depois de 60 minutos
+(`LIMITE_HEARTBEAT_MIN`). Isso evita alarme falso em hora parada — mas significa
+que uma ponte morta é discreta. Se ninguém olhar a linha, ninguém percebe.
 
 **Homônimos.** Dois clientes com mesmo nome e mesmo valor no mesmo minuto viram
 uma linha só pela deduplicação. Com valores padronizados (vários pedidos de

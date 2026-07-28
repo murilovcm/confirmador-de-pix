@@ -36,7 +36,9 @@ INGEST_TOKEN = os.environ.get("INGEST_TOKEN", "")
 PAINEL_SENHA = os.environ.get("PAINEL_SENHA", "")
 SENHA_BRUTOS = os.environ.get("SENHA_BRUTOS", "")
 N8N_WEBHOOK = os.environ.get("N8N_WEBHOOK_URL", "").strip()
-LIMITE_HEARTBEAT_MIN = int(os.environ.get("LIMITE_HEARTBEAT_MIN", "25"))
+# Depois disso o painel pinta a idade da ultima atualizacao de ambar. Nao gera
+# alarme nem faixa: so tira o verde de quem afirma que esta tudo em dia.
+LIMITE_HEARTBEAT_MIN = int(os.environ.get("LIMITE_HEARTBEAT_MIN", "60"))
 
 # Hora em que o histórico é apagado. A loja já fechou, não há pedido em voo.
 HORA_LIMPEZA = int(os.environ.get("HORA_LIMPEZA", "2"))
