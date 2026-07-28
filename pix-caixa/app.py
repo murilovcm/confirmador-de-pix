@@ -180,6 +180,11 @@ def avisar_n8n(payload: dict):
 
 def token_valido() -> bool:
     enviado = request.headers.get("X-Ingest-Token", "")
+    if not enviado:
+        # O Traefik do EasyPanel remove o X-Ingest-Token em requisições
+        # externas; o Authorization: Bearer passa.
+        auth = request.headers.get("Authorization", "")
+        enviado = auth[7:] if auth.lower().startswith("bearer ") else auth
     return bool(INGEST_TOKEN) and hmac.compare_digest(enviado, INGEST_TOKEN)
 
 
