@@ -86,8 +86,8 @@
 <div class="vazio" id="vazio" hidden>Nenhum Pix nas últimas 24 horas.</div>
 
 <footer>
-  Esta tela é ferramenta de conferência.<br>
-  Em caso de dúvida ou valor alto, confirme no app do Mercado Pago antes de entregar.
+  Esta tela é ferramenta de conferência e pode ter um delay de até 3 minutos pra confirmar.<br>
+  Em caso de dúvida ou valor alto, sempre confirmar no grupo de WhatsAPP da loja antes de entregar o produto.
   <br><button class="som" id="som">🔔 Ativar som</button>
   <button class="som" id="testar">▶ Testar alerta</button>
   <div class="teste" id="teste" hidden></div>
@@ -221,46 +221,6 @@ function mostraChecklist(){
 pintaSom();
 if (somOn){ garanteCtx().resume().then(revisaBloqueio).catch(revisaBloqueio); }
 
-// --- Pulso enquanto houver Pix a conferir --------------------------------
-// Um bip so, no instante da chegada, se perde se ninguem estava no balcao.
-// Aqui ele repete devagar ate alguem conferir.
-//
-// Para sozinho depois de LIMITE_PULSO: se 15 minutos de insistencia nao
-// chamaram ninguem, nao tem ninguem la, e continuar apitando so ensina o
-// funcionario a desligar o som de vez -- perdendo os Pix de verdade. O Pix
-// continua na lista, sem tarja de conferido, esperando o clique.
-const INTERVALO_PULSO = 3000;         // 3s entre bips
-const LIMITE_PULSO = 15 * 60 * 1000;  // 15 min de insistencia
-
-let pendentesAgora = 0, pulsoDesde = null, timerPulso = null;
-
-function agendaPulso(){
-  clearTimeout(timerPulso);
-  timerPulso = setTimeout(() => {
-    if (pendentesAgora > 0 && pulsoDesde !== null
-        && Date.now() - pulsoDesde < LIMITE_PULSO){
-      if (somOn) bip();
-      // segue agendando mesmo com o som desligado: se alguem ligar no meio
-      // da janela, o pulso volta sozinho
-      agendaPulso();
-    }
-  }, INTERVALO_PULSO);
-}
-
-function ajustaPulso(pendentes, houveNovo){
-  pendentesAgora = pendentes;
-  if (pendentes === 0){
-    pulsoDesde = null;
-    clearTimeout(timerPulso);
-    return;
-  }
-  // Pix novo reabre a janela inteira: cada chegada merece os 15 min dela
-  if (houveNovo || pulsoDesde === null){
-    pulsoDesde = Date.now();
-    agendaPulso();
-  }
-}
-
 function bip(){
   if (!ctx) return;
   [880, 1320].forEach((hz, i) => {
@@ -335,7 +295,6 @@ function render(d){
   }
 
   if (novos > 0 && somOn) bip();
-  ajustaPulso(d.pendentes, novos > 0);
   // roda a cada 4s junto com o polling: se o navegador suspender o audio com a
   // aba em segundo plano, a faixa aparece sozinha, sem esperar um teste manual
   revisaBloqueio();
