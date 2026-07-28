@@ -193,6 +193,32 @@ Se o som estiver desligado na hora do teste, ele é **ligado automaticamente** e
 a tela avisa que ligou. Um botão de teste mudo faria o funcionário concluir que
 o alerta quebrou.
 
+### O pulso: insiste até alguém conferir
+
+Um bip único, no instante da chegada, se perde se ninguém estava no balcão. Por
+isso o alerta **repete a cada 3 segundos enquanto houver Pix não conferido**, e
+para no clique em *Conferir*.
+
+Vale para **qualquer** pendente, inclusive os que já estavam na tela quando a
+página carregou. É de propósito: se o tablet reinicia sozinho com Pix pendente,
+esses são justamente os que correm mais risco de serem esquecidos, porque
+ninguém viu chegar.
+
+Cada Pix novo reabre a janela inteira de insistência.
+
+**O pulso desiste depois de 15 minutos** (≈ 300 bips) e o Pix continua na lista,
+sem tarja de conferido, esperando o clique. O motivo é de operação, não técnico:
+se 15 minutos de insistência não chamaram ninguém, não tem ninguém lá, e
+continuar apitando a noite toda só ensina o funcionário a desligar o som de vez
+— e aí você perde os Pix de verdade.
+
+Os dois números vivem no topo do `<script>` do `painel.html`:
+
+```js
+const INTERVALO_PULSO = 3000;         // 3s entre bips
+const LIMITE_PULSO = 15 * 60 * 1000;  // 15 min de insistência
+```
+
 ### Duas armadilhas que o painel agora cobre
 
 **O som voltava desligado a cada reload.** Reinício do tablet, aba reaberta,
