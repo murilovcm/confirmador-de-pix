@@ -14,6 +14,7 @@ import os
 import re
 import sqlite3
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 
@@ -33,8 +34,15 @@ TZ = timezone(timedelta(hours=-3))
 DB_PATH = os.environ.get("DB_PATH", "/data/pix.db")
 INGEST_TOKEN = os.environ.get("INGEST_TOKEN", "")
 PAINEL_SENHA = os.environ.get("PAINEL_SENHA", "")
+SENHA_BRUTOS = os.environ.get("SENHA_BRUTOS", "")
 N8N_WEBHOOK = os.environ.get("N8N_WEBHOOK_URL", "").strip()
 LIMITE_HEARTBEAT_MIN = int(os.environ.get("LIMITE_HEARTBEAT_MIN", "25"))
+
+# Hora em que o histórico é apagado. A loja já fechou, não há pedido em voo.
+HORA_LIMPEZA = int(os.environ.get("HORA_LIMPEZA", "2"))
+
+# Quanto tempo o desbloqueio de /brutos vale antes de pedir a senha de novo.
+VALIDADE_BRUTOS_MIN = 15
 
 # Marcador de build — serve pra provar qual versão do código está rodando
 # no container. Bumpar a cada deploy que precise ser verificado.
@@ -65,6 +73,11 @@ CREATE TABLE IF NOT EXISTS heartbeat (
     origem      TEXT PRIMARY KEY,
     ultimo_ping TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS manutencao (
+    chave           TEXT PRIMARY KEY,
+    ultima_execucao TEXT NOT NULL
+);
 """
 
 
@@ -88,9 +101,82 @@ def init_db():
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     con = sqlite3.connect(DB_PATH, timeout=10)
     con.executescript(ESQUEMA)
+    # Banco novo já nasce com o ciclo corrente marcado como feito: sem isso,
+    # um deploy às 15h dispararia a limpeza na hora e levaria o dia junto.
+    con.execute(
+        "INSERT OR IGNORE INTO manutencao (chave, ultima_execucao) VALUES (?, ?)",
+        ("limpeza_pix", ciclo_atual()),
+    )
     con.commit()
     con.close()
     log.info("banco pronto em %s", DB_PATH)
+
+
+# --------------------------------------------------------------------------
+# Limpeza automática do histórico
+#
+# Todo dia às HORA_LIMPEZA a tabela `pix` é esvaziada por completo — os
+# recebimentos e também as notificações não reconhecidas, que carregam nome e
+# valor no texto bruto. O `heartbeat` sobrevive: é status da ponte, não dado de
+# cliente, e zerá-lo faria o painel acusar "ponte offline" sem motivo.
+#
+# São dois workers do gunicorn, logo esta rotina nasce duas vezes. Quem apaga é
+# decidido por um UPDATE condicional: o primeiro processo a marcar o ciclo leva,
+# o segundo enxerga rowcount 0 e não faz nada.
+# --------------------------------------------------------------------------
+
+def ciclo_atual(agora=None) -> str:
+    """Dia do ciclo de limpeza vigente.
+
+    Antes da hora de corte ainda se está no expediente do dia anterior: 01:00 de
+    terça pertence ao ciclo de segunda. É isso que impede a limpeza de rodar
+    duas vezes na mesma madrugada.
+    """
+    agora = agora or datetime.now(TZ)
+    ref = agora if agora.hour >= HORA_LIMPEZA else agora - timedelta(days=1)
+    return ref.date().isoformat()
+
+
+def limpar_historico():
+    """Apaga o histórico se o ciclo corrente ainda não foi limpo."""
+    ciclo = ciclo_atual()
+    con = sqlite3.connect(DB_PATH, timeout=10)
+    try:
+        con.execute("PRAGMA busy_timeout=10000")
+        cur = con.execute(
+            """UPDATE manutencao SET ultima_execucao = ?
+               WHERE chave = 'limpeza_pix' AND ultima_execucao < ?""",
+            (ciclo, ciclo),
+        )
+        if cur.rowcount == 0:
+            con.rollback()
+            return False
+        apagados = con.execute("DELETE FROM pix").rowcount
+        con.commit()
+        # VACUUM devolve as páginas liberadas ao sistema: sem ele os registros
+        # apagados continuariam legíveis dentro do arquivo .db.
+        con.isolation_level = None
+        con.execute("VACUUM")
+        log.info("limpeza do ciclo %s: %s registros apagados", ciclo, apagados)
+        return True
+    finally:
+        con.close()
+
+
+def _loop_limpeza():
+    # Na subida, cobre o ciclo perdido caso o container estivesse fora do ar às
+    # 2h — sem isso a limpeza daquele dia seria pulada em silêncio.
+    while True:
+        try:
+            limpar_historico()
+        except Exception:
+            log.exception("falha na limpeza automática")
+
+        agora = datetime.now(TZ)
+        alvo = agora.replace(hour=HORA_LIMPEZA, minute=0, second=0, microsecond=0)
+        if alvo <= agora:
+            alvo += timedelta(days=1)
+        time.sleep(max(60, (alvo - agora).total_seconds()))
 
 
 # --------------------------------------------------------------------------
@@ -349,10 +435,9 @@ def api_pix():
         "conferido": bool(l["conferido_em"]),
     } for l in linhas]
 
-    total = sum(p["valor"] for p in pix if p["parseado"])
     pendentes = sum(1 for p in pix if not p["conferido"])
 
-    return jsonify(pontes=pontes, pix=pix, total=total, pendentes=pendentes)
+    return jsonify(pontes=pontes, pix=pix, pendentes=pendentes)
 
 
 @app.post("/api/conferir/<int:pix_id>")
@@ -367,10 +452,43 @@ def conferir(pix_id):
     return jsonify(status="ok")
 
 
-@app.get("/brutos")
+def brutos_liberado() -> bool:
+    """O desbloqueio do /brutos expira sozinho.
+
+    A sessão do painel dura 30 dias; se a segunda senha durasse o mesmo, digitar
+    ela uma vez em agosto deixaria a aba aberta até setembro — camada extra
+    nenhuma. Por isso vale por minutos, não pela sessão.
+    """
+    marca = session.get("brutos_em")
+    if not marca:
+        return False
+    try:
+        quando = datetime.fromisoformat(marca)
+    except ValueError:
+        return False
+    return datetime.now(TZ) - quando < timedelta(minutes=VALIDADE_BRUTOS_MIN)
+
+
+@app.route("/brutos", methods=["GET", "POST"])
 @exige_login
 def brutos():
     """Notificações que o parser não reconheceu. Use para ajustar os regex."""
+    erro = None
+    if request.method == "POST":
+        if SENHA_BRUTOS and hmac.compare_digest(request.form.get("senha", ""), SENHA_BRUTOS):
+            session["brutos_em"] = datetime.now(TZ).isoformat()
+        else:
+            erro = "Senha incorreta."
+
+    if not brutos_liberado():
+        return render_template(
+            "login.html",
+            erro=erro,
+            titulo="Notificações",
+            subtitulo="Área restrita — informe a senha de acesso",
+            botao="Desbloquear",
+        )
+
     db = get_db()
     linhas = db.execute(
         """SELECT id, status, recebido_em, texto_bruto FROM pix
@@ -412,6 +530,7 @@ def saude_headers():
 
 
 init_db()
+threading.Thread(target=_loop_limpeza, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))

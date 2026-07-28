@@ -47,10 +47,15 @@ e você só descobre quando precisar conferir o fechamento de ontem.
 SECRET_KEY=<primeiro token gerado>
 INGEST_TOKEN=<segundo token gerado>
 PAINEL_SENHA=<senha do painel>
+SENHA_BRUTOS=<segunda senha, só pra aba de não reconhecidas>
 N8N_WEBHOOK_URL=<url do webhook do n8n — pode deixar vazio por enquanto>
 DB_PATH=/data/pix.db
 LIMITE_HEARTBEAT_MIN=25
+HORA_LIMPEZA=2
 ```
+
+`SENHA_BRUTOS` vazia **tranca a aba pra todo mundo** — é o lado seguro pra
+falhar, mas significa que esquecer de configurar deixa `/brutos` inacessível.
 
 ---
 
@@ -159,14 +164,47 @@ impede o Pix de ser gravado nem atrasa a resposta pro celular.
 | Rota | O que é |
 |---|---|
 | `/` | Painel (exige senha) |
-| `/brutos` | Notificações não reconhecidas — use pra ajustar os regex |
+| `/brutos` | Notificações não reconhecidas — exige a senha do painel **e** a `SENHA_BRUTOS` |
 | `/saude` | Healthcheck, sem autenticação |
 | `/ingest/pix` | POST do celular (exige token) |
 | `/ingest/ping` | Heartbeat (exige token) |
 
+O desbloqueio de `/brutos` vale **15 minutos** e depois pede a senha de novo. É
+de propósito: a sessão do painel dura 30 dias, e uma segunda senha que durasse o
+mesmo não protegeria nada.
+
 ---
 
-## 7. Ajustar o parser quando o MP mudar o texto
+## 7. Limpeza automática às 2h
+
+Todo dia às **2h da manhã** — loja fechada, sem pedido em voo — a tabela `pix` é
+esvaziada por inteiro: recebimentos confirmados **e** notificações não
+reconhecidas. O `texto_bruto` das não reconhecidas carrega nome e valor de
+cliente, então meia limpeza não seria limpeza.
+
+Depois do `DELETE` roda um `VACUUM`: sem ele as páginas liberadas continuariam
+legíveis dentro do arquivo `.db`.
+
+**O que isso te custa:** você perde o material de calibrar regex do dia
+anterior. Se aparecer um formato novo de notificação, copie o texto de `/brutos`
+**no mesmo dia** — às 2h ele vai embora.
+
+O `heartbeat` sobrevive à limpeza. Ele é status da ponte, não dado de cliente, e
+zerá-lo faria o painel acusar "ponte offline" sem motivo.
+
+Se o container estiver fora do ar às 2h, a limpeza roda assim que ele subir —
+não é pulada em silêncio. Rodando com dois workers do gunicorn, só um apaga: o
+outro perde a corrida pelo marcador e não faz nada.
+
+Pra conferir que está ativo, o log do container mostra:
+
+```
+limpeza do ciclo 2026-07-28: 37 registros apagados
+```
+
+---
+
+## 8. Ajustar o parser quando o MP mudar o texto
 
 Toda notificação que o parser não entende fica em `/brutos` com o texto cru.
 Quando aparecer formato novo:
@@ -192,5 +230,7 @@ heartbeat avisa em até 25 min, e o arquivo local guarda o que não foi enviado.
 uma linha só pela deduplicação. Com valores padronizados (vários pedidos de
 R$ 100) isso é menos raro do que parece.
 
-**Conferência diária.** No fechamento, cruza o total do painel com o extrato do
-MP. É o que pega qualquer Pix que a ponte perdeu.
+**Conferência diária.** No fechamento, cruza o extrato do MP com o que passou
+pelo painel — é o que pega qualquer Pix que a ponte perdeu. Faça isso **antes
+das 2h**: o painel não mostra mais somatório e o histórico é apagado na
+virada, então o extrato do Mercado Pago é a única fonte no dia seguinte.

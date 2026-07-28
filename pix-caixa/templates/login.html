@@ -24,10 +24,10 @@
 <body>
   <form class="card" method="post">
     <div class="selo"><i></i> Acesso restrito</div>
-    <h1>Caixa</h1>
-    <p>Confirmação de Pix recebidos</p>
+    <h1>{{ titulo|default('Caixa') }}</h1>
+    <p>{{ subtitulo|default('Confirmação de Pix recebidos') }}</p>
     <input type="password" name="senha" placeholder="Senha" autocomplete="current-password" autofocus required>
-    <button type="submit">Entrar</button>
+    <button type="submit">{{ botao|default('Entrar') }}</button>
     {% if erro %}<div class="erro">{{ erro }}</div>{% endif %}
   </form>
 </body>
