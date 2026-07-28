@@ -175,7 +175,44 @@ mesmo não protegeria nada.
 
 ---
 
-## 7. Limpeza automática às 2h
+## 7. Alerta sonoro no painel
+
+O funcionário confia no ouvido, não na tela. Por isso o som tem botão de teste
+próprio, no rodapé: **▶ Testar alerta**.
+
+O teste toca o mesmo bip de um Pix novo e pergunta **"Ouviu o alerta?"**. A
+confirmação é humana de propósito — o navegador consegue mandar tocar, mas não
+consegue saber se o tablet está no mudo, com volume zero ou com um fone
+esquecido conectado. Um teste que se autoaprova mentiria justamente nesses casos.
+
+- **"Sim, ouvi"** → confirma e a mensagem some sozinha em 10 segundos.
+- **"Não ouvi"** → abre a lista do que checar e **fica na tela** até alguém
+  resolver e testar de novo. Estado de problema não some sozinho.
+
+Se o som estiver desligado na hora do teste, ele é **ligado automaticamente** e
+a tela avisa que ligou. Um botão de teste mudo faria o funcionário concluir que
+o alerta quebrou.
+
+### Duas armadilhas que o painel agora cobre
+
+**O som voltava desligado a cada reload.** Reinício do tablet, aba reaberta,
+bateria acabada — e ninguém percebe um som ausente. Agora a preferência fica
+salva no navegador e sobrevive ao reload.
+
+**O navegador suspende o áudio.** Por política de autoplay, ele exige um toque
+na tela antes de liberar som. Com a aba muito tempo em segundo plano isso pode
+voltar a acontecer. Quando acontece, aparece a faixa âmbar *"Som travado pelo
+navegador"* — qualquer toque na tela destrava. O painel checa esse estado a cada
+4 segundos, junto com a atualização da lista, então a faixa aparece sozinha sem
+depender de alguém testar.
+
+> O teste de som **não** verifica se o celular está entregando os Pix. Quem faz
+> isso é o indicador de ponte (a bolinha e o "Sem sinal há X min"), que checa
+> sozinho a cada 10 minutos. São dois problemas diferentes.
+
+---
+
+## 8. Limpeza automática às 2h
 
 Todo dia às **2h da manhã** — loja fechada, sem pedido em voo — a tabela `pix` é
 esvaziada por inteiro: recebimentos confirmados **e** notificações não
@@ -204,7 +241,7 @@ limpeza do ciclo 2026-07-28: 37 registros apagados
 
 ---
 
-## 8. Ajustar o parser quando o MP mudar o texto
+## 9. Ajustar o parser quando o MP mudar o texto
 
 Toda notificação que o parser não entende fica em `/brutos` com o texto cru.
 Quando aparecer formato novo:

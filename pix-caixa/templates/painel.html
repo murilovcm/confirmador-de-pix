@@ -48,6 +48,19 @@
   footer{margin-top:28px;padding-top:18px;border-top:1px solid var(--linha);color:var(--txt2);font-size:12.5px;line-height:1.55;text-align:center}
   .som{background:none;border:1px solid var(--linha);color:var(--txt2);border-radius:9999px;padding:9px 18px;font-size:13px;cursor:pointer;margin-top:14px}
   .som.on{border-color:var(--accent);color:var(--accent)}
+  .aviso.morno{background:rgba(255,176,32,.12);border-color:#FFB020;color:#FFD79A}
+
+  /* Painel do teste de alerta sonoro */
+  .teste{margin-top:16px;background:var(--surface);border:1px solid var(--linha);border-radius:14px;padding:15px 16px;font-size:14px;color:var(--txt);text-align:left;line-height:1.45}
+  .teste.ok{border-color:var(--accent)}
+  .teste.ruim{border-color:#FFB020}
+  .teste .nota{color:var(--txt2);font-size:12.5px;margin-bottom:9px}
+  .teste .acoes{display:flex;gap:10px;margin-top:12px;flex-wrap:wrap}
+  .teste button{background:none;border:1px solid var(--linha);color:var(--txt);border-radius:9999px;padding:10px 20px;font-size:14px;cursor:pointer;margin:0}
+  .teste button.sim{border-color:var(--accent);color:var(--accent)}
+  /* zera o estilo de cartao que as regras globais de ul/li aplicam */
+  .teste ul{list-style:disc;margin:10px 0 0 18px;display:block;gap:0}
+  .teste li{background:none;border:none;border-radius:0;padding:3px 0;display:list-item;animation:none;color:var(--txt2);font-size:13px}
   a{color:var(--txt2)}
 </style>
 </head>
@@ -66,6 +79,10 @@
     <strong>Ponte offline.</strong> Novos Pix podem não estar aparecendo aqui.
     Confira direto no app do Mercado Pago e verifique o celular.
   </div>
+  <div class="aviso morno" id="avisoSom">
+    <strong>Som travado pelo navegador.</strong> O alerta não vai tocar até
+    alguém encostar na tela. Toque em qualquer lugar para liberar.
+  </div>
 </header>
 
 <ul id="lista"></ul>
@@ -75,22 +92,140 @@
   Esta tela é ferramenta de conferência.<br>
   Em caso de dúvida ou valor alto, confirme no app do Mercado Pago antes de entregar.
   <br><button class="som" id="som">🔔 Ativar som</button>
+  <button class="som" id="testar">▶ Testar alerta</button>
+  <div class="teste" id="teste" hidden></div>
   <br><br><a href="/brutos">Notificações não reconhecidas</a>
 </footer>
 
 <script>
 const brl = c => (c/100).toLocaleString('pt-BR',{style:'currency',currency:'BRL'});
-let vistos = new Set(), primeira = true, somOn = false, ctx = null;
+let vistos = new Set(), primeira = true, ctx = null;
 
-document.getElementById('som').onclick = e => {
+// --- Alerta sonoro -------------------------------------------------------
+// A preferencia fica no localStorage: sem isso o som voltava desligado a cada
+// reload do tablet, sem nada na tela avisando. Ninguem percebe um som ausente.
+const SOM_CHAVE = 'caixa:som';
+let somOn = localStorage.getItem(SOM_CHAVE) === '1';
+
+const btnSom = document.getElementById('som');
+const btnTestar = document.getElementById('testar');
+const boxTeste = document.getElementById('teste');
+let sumirTeste = null;
+
+function pintaSom(){
+  btnSom.classList.toggle('on', somOn);
+  btnSom.textContent = somOn ? '🔔 Som ativado' : '🔔 Ativar som';
+}
+
+function garanteCtx(){
+  ctx = ctx || new (window.AudioContext||window.webkitAudioContext)();
+  return ctx;
+}
+
+// O navegador so libera audio depois de um toque na tela. Restaurar a
+// preferencia nao basta: o contexto acorda suspenso e o bip sai mudo.
+// Aqui a gente enxerga esse estado em vez de falhar calado.
+function revisaBloqueio(){
+  const travado = somOn && ctx && ctx.state !== 'running';
+  document.getElementById('avisoSom').classList.toggle('ver', !!travado);
+}
+
+['pointerdown','keydown','touchstart'].forEach(ev =>
+  document.addEventListener(ev, () => {
+    if (somOn && ctx && ctx.state !== 'running') ctx.resume().then(revisaBloqueio);
+  }, {passive:true})
+);
+
+btnSom.onclick = () => {
   somOn = !somOn;
-  e.target.classList.toggle('on', somOn);
-  e.target.textContent = somOn ? '🔔 Som ativado' : '🔔 Ativar som';
-  if (somOn) { ctx = ctx || new (window.AudioContext||window.webkitAudioContext)(); bip(); }
+  localStorage.setItem(SOM_CHAVE, somOn ? '1' : '0');
+  pintaSom();
+  if (somOn) garanteCtx().resume().then(() => { bip(); revisaBloqueio(); });
+  else revisaBloqueio();
 };
 
+function limpaTeste(){
+  clearTimeout(sumirTeste);
+  boxTeste.hidden = false;
+  boxTeste.className = 'teste';
+  boxTeste.textContent = '';
+}
+
+btnTestar.onclick = () => {
+  // Um botao de teste que fica mudo porque o som estava desligado faria o
+  // funcionario concluir que o alerta quebrou. Liga e avisa que ligou.
+  const ligouAgora = !somOn;
+  if (ligouAgora){
+    somOn = true;
+    localStorage.setItem(SOM_CHAVE, '1');
+    pintaSom();
+  }
+  // resume() e assincrono: tocar antes dele resolver sai mudo justo no teste
+  garanteCtx().resume()
+    .then(() => { bip(); perguntaOuviu(ligouAgora); revisaBloqueio(); })
+    .catch(() => perguntaOuviu(ligouAgora));
+};
+
+function perguntaOuviu(ligouAgora){
+  limpaTeste();
+  if (ligouAgora){
+    const nota = document.createElement('div');
+    nota.className = 'nota';
+    nota.textContent = 'O som estava desligado. Liguei agora.';
+    boxTeste.appendChild(nota);
+  }
+  const titulo = document.createElement('strong');
+  titulo.textContent = 'Ouviu o alerta?';
+  const acoes = document.createElement('div');
+  acoes.className = 'acoes';
+  const sim = document.createElement('button');
+  sim.className = 'sim'; sim.textContent = 'Sim, ouvi';
+  sim.onclick = confirmaOk;
+  const nao = document.createElement('button');
+  nao.textContent = 'Não ouvi';
+  nao.onclick = mostraChecklist;
+  acoes.append(sim, nao);
+  boxTeste.append(titulo, acoes);
+}
+
+function confirmaOk(){
+  limpaTeste();
+  boxTeste.className = 'teste ok';
+  boxTeste.textContent = '✓ Alerta funcionando. Cada Pix novo vai tocar assim.';
+  sumirTeste = setTimeout(() => { boxTeste.hidden = true; }, 10000);
+}
+
+function mostraChecklist(){
+  // Estado de problema nao some sozinho: fica ate ser resolvido e testado.
+  limpaTeste();
+  boxTeste.className = 'teste ruim';
+  const titulo = document.createElement('strong');
+  titulo.textContent = 'Sem som. Confira nesta ordem:';
+  const lista = document.createElement('ul');
+  [
+    'Volume da mídia no máximo — o botão lateral costuma mexer só na campainha',
+    'Modo silencioso e Não perturbe desligados',
+    'Nenhum fone ou caixa Bluetooth conectado levando o som pra longe',
+    'Esta aba aberta na frente, não em segundo plano',
+  ].forEach(txt => {
+    const li = document.createElement('li');
+    li.textContent = txt;
+    lista.appendChild(li);
+  });
+  const acoes = document.createElement('div');
+  acoes.className = 'acoes';
+  const denovo = document.createElement('button');
+  denovo.textContent = 'Testar de novo';
+  denovo.onclick = () => btnTestar.click();
+  acoes.appendChild(denovo);
+  boxTeste.append(titulo, lista, acoes);
+}
+
+pintaSom();
+if (somOn){ garanteCtx().resume().then(revisaBloqueio).catch(revisaBloqueio); }
+
 function bip(){
-  if (!somOn || !ctx) return;
+  if (!ctx) return;
   [880, 1320].forEach((hz, i) => {
     const o = ctx.createOscillator(), g = ctx.createGain();
     o.frequency.value = hz; o.type = 'sine';
@@ -147,7 +282,10 @@ function render(d){
     ul.appendChild(li);
   }
 
-  if (novos > 0) bip();
+  if (novos > 0 && somOn) bip();
+  // roda a cada 4s junto com o polling: se o navegador suspender o audio com a
+  // aba em segundo plano, a faixa aparece sozinha, sem esperar um teste manual
+  revisaBloqueio();
   primeira = false;
 }
 
