@@ -36,6 +36,11 @@ PAINEL_SENHA = os.environ.get("PAINEL_SENHA", "")
 N8N_WEBHOOK = os.environ.get("N8N_WEBHOOK_URL", "").strip()
 LIMITE_HEARTBEAT_MIN = int(os.environ.get("LIMITE_HEARTBEAT_MIN", "25"))
 
+# Marcador de build — serve pra provar qual versão do código está rodando
+# no container. Bumpar a cada deploy que precise ser verificado.
+# TEMPORÁRIO: remover junto com /saude/headers quando o 401 estiver resolvido.
+VERSAO = "auth-header-fix-1"
+
 
 # --------------------------------------------------------------------------
 # Banco
@@ -383,7 +388,27 @@ def brutos():
 
 @app.get("/saude")
 def saude():
-    return jsonify(ok=True, hora=datetime.now(TZ).isoformat())
+    return jsonify(ok=True, hora=datetime.now(TZ).isoformat(), versao=VERSAO)
+
+
+# TEMPORÁRIO — diagnóstico do 401 atrás do Traefik.
+# Devolve só NOMES e TAMANHOS de header; nunca o valor de nenhum deles.
+# Remover junto com VERSAO quando a causa estiver identificada.
+@app.get("/saude/headers")
+def saude_headers():
+    xit = request.headers.get("X-Ingest-Token", "")
+    auth = request.headers.get("Authorization", "")
+    return jsonify(
+        versao=VERSAO,
+        headers_recebidos=sorted(request.headers.keys()),
+        x_ingest_token_chegou=bool(xit),
+        x_ingest_token_len=len(xit),
+        authorization_chegou=bool(auth),
+        authorization_len=len(auth),
+        authorization_tem_prefixo_bearer=auth.lower().startswith("bearer "),
+        ingest_token_configurado=bool(INGEST_TOKEN),
+        ingest_token_len=len(INGEST_TOKEN),
+    )
 
 
 init_db()
