@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#111418">
+<title>Caixa — Pix recebidos</title>
+<style>
+  :root{
+    --bg:#111418; --surface:#1A1F27; --linha:#252B35;
+    --accent:#AEFF00; --accent-esc:#0D0D0D;
+    --txt:#FFFFFF; --txt2:#9BA3AF; --alerta:#F04438;
+  }
+  *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+  body{
+    background:var(--bg); color:var(--txt); min-height:100dvh;
+    font:400 16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    padding:0 20px calc(32px + env(safe-area-inset-bottom));
+    max-width:780px; margin:0 auto;
+  }
+  header{position:sticky;top:0;background:var(--bg);z-index:10;padding:20px 0 14px;border-bottom:1px solid var(--linha)}
+  .topo{display:flex;align-items:center;justify-content:space-between;gap:12px}
+  h1{font-size:19px;font-weight:800;letter-spacing:-.3px}
+  .sair{background:none;border:1px solid var(--linha);color:var(--txt2);border-radius:9999px;padding:8px 16px;font-size:13px;cursor:pointer}
+  .resumo{display:flex;gap:22px;margin-top:14px;flex-wrap:wrap}
+  .resumo div{font-size:12.5px;color:var(--txt2)}
+  .resumo b{display:block;font-size:21px;font-weight:800;color:var(--txt);letter-spacing:-.4px;margin-top:2px}
+  .status{display:flex;align-items:center;gap:8px;margin-top:14px;font-size:13px;color:var(--txt2)}
+  .ponto{width:8px;height:8px;border-radius:9999px;background:#22C55E;flex:none}
+  .ponto.off{background:var(--alerta)}
+  .aviso{display:none;background:rgba(240,68,56,.12);border:1px solid var(--alerta);color:#FFB4AE;border-radius:14px;padding:14px 16px;margin-top:14px;font-size:14px;line-height:1.45}
+  .aviso.ver{display:block}
+
+  ul{list-style:none;margin-top:20px;display:flex;flex-direction:column;gap:10px}
+  li{background:var(--surface);border:1px solid var(--linha);border-radius:16px;padding:16px;display:flex;align-items:center;gap:14px;animation:entra .35s ease both}
+  @keyframes entra{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:none}}
+  li.novo{border-color:var(--accent);box-shadow:0 0 0 3px rgba(174,255,0,.12)}
+  li.feito{opacity:.42}
+  .dados{flex:1;min-width:0}
+  .valor{font-size:26px;font-weight:800;letter-spacing:-.6px;line-height:1.15}
+  li.feito .valor{text-decoration:line-through}
+  .nome{color:var(--txt2);font-size:14px;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .hora{color:var(--txt2);font-size:12px;margin-top:6px;font-variant-numeric:tabular-nums}
+  .btn{flex:none;background:var(--accent);color:var(--accent-esc);border:none;border-radius:9999px;padding:0 22px;height:48px;min-width:104px;font-size:15px;font-weight:700;cursor:pointer}
+  .btn:active{transform:scale(.97)}
+  .btn.ok{background:transparent;color:var(--txt2);border:1px solid var(--linha);font-weight:500}
+  .vazio{text-align:center;color:var(--txt2);padding:56px 20px;font-size:15px}
+  footer{margin-top:28px;padding-top:18px;border-top:1px solid var(--linha);color:var(--txt2);font-size:12.5px;line-height:1.55;text-align:center}
+  .som{background:none;border:1px solid var(--linha);color:var(--txt2);border-radius:9999px;padding:9px 18px;font-size:13px;cursor:pointer;margin-top:14px}
+  .som.on{border-color:var(--accent);color:var(--accent)}
+  a{color:var(--txt2)}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="topo">
+    <h1>Pix recebidos</h1>
+    <form method="post" action="/sair"><button class="sair">Sair</button></form>
+  </div>
+  <div class="resumo">
+    <div>Recebido em 24h<b id="total">—</b></div>
+    <div>A conferir<b id="pendentes">—</b></div>
+  </div>
+  <div class="status"><span class="ponto" id="ponto"></span><span id="statusTxt">conectando…</span></div>
+  <div class="aviso" id="aviso">
+    <strong>Ponte offline.</strong> Novos Pix podem não estar aparecendo aqui.
+    Confira direto no app do Mercado Pago e verifique o celular.
+  </div>
+</header>
+
+<ul id="lista"></ul>
+<div class="vazio" id="vazio" hidden>Nenhum Pix nas últimas 24 horas.</div>
+
+<footer>
+  Esta tela é ferramenta de conferência.<br>
+  Em caso de dúvida ou valor alto, confirme no app do Mercado Pago antes de entregar.
+  <br><button class="som" id="som">🔔 Ativar som</button>
+  <br><br><a href="/brutos">Notificações não reconhecidas</a>
+</footer>
+
+<script>
+const brl = c => (c/100).toLocaleString('pt-BR',{style:'currency',currency:'BRL'});
+let vistos = new Set(), primeira = true, somOn = false, ctx = null;
+
+document.getElementById('som').onclick = e => {
+  somOn = !somOn;
+  e.target.classList.toggle('on', somOn);
+  e.target.textContent = somOn ? '🔔 Som ativado' : '🔔 Ativar som';
+  if (somOn) { ctx = ctx || new (window.AudioContext||window.webkitAudioContext)(); bip(); }
+};
+
+function bip(){
+  if (!somOn || !ctx) return;
+  [880, 1320].forEach((hz, i) => {
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    o.frequency.value = hz; o.type = 'sine';
+    g.gain.setValueAtTime(.0001, ctx.currentTime + i*.14);
+    g.gain.exponentialRampToValueAtTime(.25, ctx.currentTime + i*.14 + .02);
+    g.gain.exponentialRampToValueAtTime(.0001, ctx.currentTime + i*.14 + .22);
+    o.connect(g); g.connect(ctx.destination);
+    o.start(ctx.currentTime + i*.14); o.stop(ctx.currentTime + i*.14 + .24);
+  });
+}
+
+async function conferir(id, botao){
+  botao.disabled = true;
+  try { await fetch('/api/conferir/'+id, {method:'POST'}); await carregar(); }
+  catch { botao.disabled = false; }
+}
+
+function render(d){
+  const online = d.pontes.some(p => p.online);
+  document.getElementById('ponto').classList.toggle('off', !online);
+  document.getElementById('statusTxt').textContent = online
+    ? 'Recebendo normalmente'
+    : 'Sem sinal do celular há ' + Math.min(...d.pontes.map(p=>p.minutos)) + ' min';
+  document.getElementById('aviso').classList.toggle('ver', !online);
+  document.getElementById('total').textContent = brl(d.total);
+  document.getElementById('pendentes').textContent = d.pendentes;
+
+  const ul = document.getElementById('lista');
+  document.getElementById('vazio').hidden = d.pix.length > 0;
+  ul.innerHTML = '';
+  let novos = 0;
+
+  for (const p of d.pix){
+    const inedito = !vistos.has(p.id);
+    if (inedito && !primeira && !p.conferido) novos++;
+    vistos.add(p.id);
+
+    const li = document.createElement('li');
+    li.className = (p.conferido ? 'feito' : '') + (inedito && !primeira ? ' novo' : '');
+    const dados = document.createElement('div');
+    dados.className = 'dados';
+    const v = document.createElement('div'); v.className = 'valor';
+    v.textContent = p.parseado ? brl(p.valor) : 'Valor não lido';
+    const n = document.createElement('div'); n.className = 'nome'; n.textContent = p.pagador;
+    const h = document.createElement('div'); h.className = 'hora'; h.textContent = p.hora;
+    dados.append(v, n, h);
+
+    const b = document.createElement('button');
+    b.className = 'btn' + (p.conferido ? ' ok' : '');
+    b.textContent = p.conferido ? 'Conferido' : 'Conferir';
+    b.disabled = p.conferido;
+    if (!p.conferido) b.onclick = () => conferir(p.id, b);
+
+    li.append(dados, b);
+    ul.appendChild(li);
+  }
+
+  if (novos > 0) bip();
+  primeira = false;
+}
+
+async function carregar(){
+  try {
+    const r = await fetch('/api/pix');
+    if (r.redirected) return location.href = '/login';
+    render(await r.json());
+  } catch(e){
+    document.getElementById('statusTxt').textContent = 'Sem conexão com o servidor';
+    document.getElementById('ponto').classList.add('off');
+  }
+}
+
+carregar();
+setInterval(carregar, 4000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) carregar(); });
+</script>
+</body>
+</html>
