@@ -431,10 +431,27 @@ que fica verde e vira âmbar depois de `LIMITE_HEARTBEAT_MIN`. Isso evita alarme
 falso — mas significa que uma ponte morta é discreta. Se ninguém olhar a linha,
 ninguém percebe.
 
-**Homônimos.** Só nos e-mails que chegarem sem o `ID da transação`: aí a dedup
-volta a ser valor + nome + minuto, e dois clientes de mesmo nome pagando o mesmo
-valor no mesmo minuto viram uma linha só. Com o UUID presente — o caso normal —
-isso não acontece.
+**Dois Pix do mesmo valor caem certo.** Vale dizer porque é a dúvida que sempre
+aparece: dois pagamentos são dois `ID da transação` diferentes, e a dedup usa
+**só** o UUID. Valor, nome e horário nem entram na conta. Testado:
+
+| Cenário | Resultado |
+|---|---|
+| Clientes diferentes, R$ 100 cada, mesmo minuto | duas linhas |
+| O **mesmo** cliente, R$ 100 duas vezes, mesmo minuto | duas linhas |
+| O mesmo e-mail reenviado | uma linha |
+
+**Mas se o e-mail chegar sem o `ID da transação`**, a chave cai pro critério de
+reserva `valor + nome + minuto` — e aí dois Pix idênticos no mesmo minuto viram
+uma linha só. O segundo some **sem erro, sem log e sem rastro no painel**.
+
+Nunca aconteceu até hoje: o UUID veio em todos os e-mails reais. O risco foi
+avaliado e aceito, mas o modo de falha é dinheiro que entrou e não apareceu na
+tela — se um dia o `/brutos` mostrar comprovante sem o UUID, feche o buraco em
+vez de conviver com ele. A saída pronta é o Apps Script mandar o identificador
+da mensagem do Gmail (`msg.getId()`) como `?msg=<id>` na URL, e o `ingest_pix`
+usar `gmail|<id>` como chave antes de cair no `valor + nome + minuto`: cada
+e-mail tem o seu, ele não muda em reenvio, e são cerca de quatro linhas.
 
 **Conferência diária.** No fechamento, cruza o extrato do PicPay com o que passou
 pelo painel — é o que pega qualquer Pix que a ponte perdeu. Faça isso **antes
