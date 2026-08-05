@@ -288,6 +288,58 @@ O Mercado Pago entra por notificação do Android. O PicPay entra pelo e-mail
 mesmo token. Não há rota nova nem token novo: o `parse()` reconhece o formato
 sozinho e desvia.
 
+### Ligando o Gmail (workflow no n8n)
+
+Workflow novo, separado do que consome o `N8N_WEBHOOK_URL` — este aqui **entra**
+no caixa, o outro **sai** dele.
+
+**1. Node `Gmail Trigger`**
+
+| Campo | Valor |
+|---|---|
+| Credential | OAuth2 da conta que recebe o comprovante |
+| Poll Times | *Every Minute* |
+| Filters → Search | `from:(no-reply@picpay.com) subject:("Pagamento recebido via Pix")` |
+| Options → Download Attachments | desligado |
+
+Confira o remetente real abrindo um comprovante de verdade na sua caixa — o
+`no-reply@picpay.com` acima é chute e o filtro errado significa canal mudo.
+Aperte **Fetch Test Event** e olhe o output antes de seguir.
+
+**2. Achar o campo com o corpo do e-mail**
+
+No output do trigger, o corpo em texto puro costuma vir em `text` (com
+*Simplify* ligado, que é o padrão). Confirme o nome no seu n8n antes de
+referenciar.
+
+> **Nunca use `snippet`.** Ele é um resumo truncado em ~200 caracteres: o
+> `ID da transação` fica de fora e você perde a dedup por UUID justamente no
+> campo que ela existe pra proteger.
+
+**3. Node `HTTP Request`**
+
+| Campo | Valor |
+|---|---|
+| Method | POST |
+| URL | `https://caixa.seudominio.com/ingest/pix` |
+| Header | `Authorization: Bearer SEU_TOKEN` |
+| Body Content Type | *Raw* → `text/plain` |
+| Body | `{{ $json.text }}` |
+
+Use `Authorization: Bearer`, não `X-Ingest-Token`: o Traefik do EasyPanel remove
+headers `X-` em requisição externa e você levaria 401 sem entender por quê. O
+token é o mesmo `INGEST_TOKEN` do celular.
+
+**4. Testar**
+
+Manda um Pix de R$ 0,01 de outra conta pro seu PicPay e espera o e-mail. No
+painel tem que aparecer valor e nome. Se aparecer "Valor não lido", o texto cru
+está em `/brutos` — é de lá que sai o ajuste do regex.
+
+Rode o workflow **duas vezes no mesmo e-mail** de propósito: a segunda tem que
+responder `{"status":"duplicado"}` e não criar linha nova. Se criar, o UUID não
+está chegando — provavelmente o corpo veio truncado.
+
 ### Como o canal é reconhecido
 
 Só vira PicPay se **os dois** marcadores existirem no texto: `Você recebeu um
@@ -353,17 +405,23 @@ O webhook dispara igual para os dois canais, com dois campos a mais no payload:
 PicPay). Campo novo não quebra fluxo existente; serve pra rotear por canal se
 um dia precisar.
 
-### Armadilha: filtre no lado do e-mail
+### Duas travas contra o e-mail promocional
 
 A lista branca do canal Android é ampla de propósito — qualquer título com
-"receb" e um `R$` vira recebimento. Isso funcionava porque só notificação do
-app do MP chegava ali. Com o e-mail no meio, **um e-mail promocional do PicPay
-que diga "você recebeu" e cite um `R$` pode virar um Pix falso no painel.**
+"receb" e um `R$` vira recebimento. Isso era seguro enquanto só notificação do
+app do MP chegava ali. Com o e-mail no meio, um promocional do PicPay que diga
+"você recebeu" e cite um `R$` viraria **dinheiro falso no painel**: ele não
+passa no reconhecimento do PicPay (falta `Valor enviado`), mas cairia no parser
+antigo.
 
-Ele não passa no reconhecimento do PicPay (falta `Valor enviado`), mas cai no
-parser antigo. A defesa é no transporte, não aqui: encaminhe para o
-`/ingest/pix` **só** os e-mails que casem com remetente e assunto do
-comprovante — nunca a caixa inteira.
+**No código:** texto sem o separador `|||` não vem do MacroDroid — que sempre
+manda `{not_title} ||| {notification}` — e não é PicPay reconhecido. Vira
+`ignorado` e vai pro `/brutos`, sem nunca contar como dinheiro. Isso significa
+que **teste manual por `curl` precisa incluir o `|||`**, como o da seção 3.
+
+**No transporte:** ainda assim, mande pro `/ingest/pix` **só** os e-mails que
+casem com remetente e assunto do comprovante — nunca a caixa inteira. A trava
+do código é rede de segurança, não substituto do filtro.
 
 ---
 

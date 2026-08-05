@@ -49,7 +49,7 @@ VALIDADE_BRUTOS_MIN = 15
 # Marcador de build — serve pra provar qual versão do código está rodando
 # no container. Bumpar a cada deploy que precise ser verificado.
 # TEMPORÁRIO: remover junto com /saude/headers quando o 401 estiver resolvido.
-VERSAO = "auth-header-fix-1"
+VERSAO = "picpay-1"
 
 
 # --------------------------------------------------------------------------
@@ -301,10 +301,16 @@ def parse(bruto: str):
         return parse_picpay(bruto)
 
     bruto = bruto.replace(">>>", " ").strip()
-    if SEP in bruto:
-        titulo, corpo = bruto.split(SEP, 1)
-    else:
-        titulo = corpo = bruto
+    if SEP not in bruto:
+        # Sem separador não veio do MacroDroid, que sempre manda
+        # "{not_title} ||| {notification}". Antes isso virava titulo=corpo=bruto
+        # e caía na lista branca ampla (qualquer "receb" + um "R$"), o que era
+        # seguro enquanto só notificação do app do MP chegava aqui. Com e-mail
+        # no meio, um promocional do PicPay que diga "você recebeu" e cite um
+        # "R$" viraria dinheiro falso no painel. Vai pro /brutos como ignorado.
+        return None, None, "ignorado", None, "mercadopago"
+
+    titulo, corpo = bruto.split(SEP, 1)
     titulo, corpo = titulo.strip(), corpo.strip()
 
     if not TITULO_RECEBIDO.search(titulo):
