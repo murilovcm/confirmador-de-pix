@@ -183,6 +183,33 @@ Manda R$ 0,01 de outra conta pro seu Nubank. Em até um minuto o painel apita.
 Se aparecer "Valor não lido", o texto cru está em `/brutos` — é de lá que sai o
 ajuste do regex, e **no mesmo dia**, porque às 2h ele é apagado.
 
+### As duas etiquetas
+
+A ponte marca no Gmail o que já processou, e a etiqueta diz **o que o coletor
+respondeu**:
+
+| Etiqueta | Significa |
+|---|---|
+| `caixa-enviado` | Virou Pix no painel (ou já estava lá) |
+| `caixa-revisar` | Chegou no servidor, mas o parser **não reconheceu** |
+| *(sem etiqueta)* | Não chegou — erro de rede, 401, servidor fora. Volta na próxima rodada |
+
+Essa separação existe porque **o coletor responde 200 nos dois primeiros
+casos.** Com uma etiqueta só, um e-mail que o parser não entendeu era marcado
+como resolvido e nunca mais voltava.
+
+Isso não é hipótese: aconteceu na virada do PicPay pro Nubank. A ponte foi
+atualizada antes do servidor, mandou comprovantes do Nubank pro parser antigo,
+recebeu `ignorado` com status 200, etiquetou tudo — e quando o parser novo
+subiu, não havia mais nada pra reprocessar. Os Pix ficaram só no `/brutos`.
+
+**Para reprocessar**, busque `label:caixa-revisar` no Gmail, remova a etiqueta e
+espere um minuto. A ponte pega de novo. Vale pra qualquer e-mail etiquetado —
+remover a etiqueta é sempre o jeito de devolver um e-mail pra fila.
+
+> Sempre que ajustar o parser, olhe o `label:caixa-revisar` antes das 2h. É a
+> fila de e-mails que entraram como `ignorado` e ainda podem virar Pix.
+
 ### Esta é a única ponte
 
 Se o gatilho for removido, se a autorização do script for revogada ou se o
@@ -412,6 +439,16 @@ O custo dessa escolha está nos *Limites conhecidos*, e é real. Leia.
 2. Ajusta o regex correspondente no `app.py` — os nomes começam com `NUBANK_`
 3. Roda o `testarBusca` no Apps Script: o veredito diz na hora se voltou a casar
 4. Deploy, e bumpa o `VERSAO` pra conseguir provar pelo `/saude` que subiu
+5. **No Gmail, busca `label:caixa-revisar` e remove a etiqueta** — a ponte
+   reprocessa os e-mails que tinham entrado como `ignorado`
+
+O passo 5 é o que transforma o conserto do regex em Pix no painel. Sem ele,
+você arruma o parser e os comprovantes antigos continuam de fora.
+
+> **Ordem do deploy:** servidor primeiro, Apps Script depois. Ponte nova
+> mandando pra servidor velho recebe `ignorado` com status 200 — e aí os
+> comprovantes vão parar no `caixa-revisar` em vez do painel. Não é perda
+> definitiva (é pra isso que a etiqueta existe), mas é meia hora de susto.
 
 O importante: **e-mail não reconhecido nunca vira confirmação de dinheiro.**
 Ele é guardado e fica visível, mas não aparece como Pix confirmado no painel.
@@ -429,9 +466,10 @@ inteira. Não existe backup local como havia no celular — o e-mail continua na
 caixa, mas ninguém o lê sozinho depois.
 
 O consolo é que o e-mail **não se perde**: se a ponte ficou dias fora, é só
-tirar a etiqueta `caixa-enviado` das conversas e alargar o `newer_than` da busca
-que o script reenvia tudo. A dedup segura o que já tinha entrado, porque a
-chave usa o horário declarado no e-mail e não muda com o reenvio.
+tirar as etiquetas `caixa-enviado` / `caixa-revisar` das conversas e alargar o
+`newer_than` da busca que o script reenvia tudo. A dedup segura o que já tinha
+entrado, porque a chave usa o horário declarado no e-mail e não muda com o
+reenvio.
 
 **O relógio mede venda, não ponte.** O ping só acontece quando chega e-mail. Não
 existe batida periódica, então **"Última atualização há 2 horas" pode ser tanto

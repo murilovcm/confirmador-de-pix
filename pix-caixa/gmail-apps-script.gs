@@ -17,9 +17,19 @@
 var REMETENTE = 'todomundo@nubank.com.br';
 var ASSUNTO = 'Você recebeu uma transferência via Pix';
 
-// Etiqueta aplicada depois do envio confirmado. É o que impede reprocessar o
-// mesmo e-mail toda rodada — e serve de trilha visível na sua caixa.
-var NOME_ETIQUETA = 'caixa-enviado';
+// DUAS etiquetas, e a diferença entre elas já custou Pix.
+//
+// O coletor responde 200 tanto pro Pix reconhecido quanto pro e-mail que ele
+// não entendeu ("ignorado"). Com uma etiqueta só, os dois eram marcados como
+// resolvidos e nunca mais voltavam — foi o que aconteceu quando a ponte rodou
+// contra um servidor que ainda não conhecia o formato do Nubank: os e-mails
+// foram etiquetados, o parser foi corrigido, e não sobrou nada pra reprocessar.
+//
+// Agora o que o parser não entendeu vai pra uma fila VISÍVEL. Depois de ajustar
+// o regex, `label:caixa-revisar` no Gmail acha tudo; removeu a etiqueta, a ponte
+// reprocessa sozinha na rodada seguinte.
+var ETIQUETA_ENVIADO = 'caixa-enviado';
+var ETIQUETA_REVISAR = 'caixa-revisar';
 
 // Teto por rodada. Um pico de e-mail não pode fazer uma execução estourar o
 // tempo e ser morta no meio: o que sobrar vai na próxima, um minuto depois.
@@ -29,7 +39,8 @@ var MAX_POR_RODADA = 15;
 // faria o script varrer a caixa inteira e reenviar o histórico todo.
 function busca_() {
   return 'from:(' + REMETENTE + ') subject:("' + ASSUNTO + '") ' +
-         '-label:' + NOME_ETIQUETA + ' newer_than:2d';
+         '-label:' + ETIQUETA_ENVIADO +
+         ' -label:' + ETIQUETA_REVISAR + ' newer_than:2d';
 }
 
 
@@ -48,9 +59,8 @@ function propriedade_(nome) {
   return v;
 }
 
-function etiqueta_() {
-  return GmailApp.getUserLabelByName(NOME_ETIQUETA) ||
-         GmailApp.createLabel(NOME_ETIQUETA);
+function etiqueta_(nome) {
+  return GmailApp.getUserLabelByName(nome) || GmailApp.createLabel(nome);
 }
 
 
@@ -92,19 +102,20 @@ function texto_(msg) {
 // --------------------------------------------------------------------------
 
 /**
- * Devolve true só quando o coletor confirmou o recebimento.
+ * Devolve o STATUS que o coletor deu — não um sim/não.
  *
- * "duplicado" conta como sucesso: o Pix já está lá, e não etiquetar faria o
- * script reenviar o mesmo e-mail pra sempre.
+ * A diferença importa: 200 não quer dizer "virou Pix". O coletor responde 200
+ * também pro e-mail que ele decidiu ignorar, e tratar os dois igual foi o que
+ * fez a ponte marcar como resolvido um comprovante que nunca chegou no painel.
  *
- * Qualquer outra resposta devolve false e a mensagem fica SEM etiqueta — a
- * próxima rodada tenta de novo. É de propósito: coletor reiniciando ou rede
- * oscilando não pode custar um Pix.
+ *   'ok' | 'duplicado'         -> entrou (ou já estava lá)
+ *   'ignorado' | 'sem_valor'   -> chegou no servidor, mas não virou dinheiro
+ *   'erro'                     -> não chegou; a próxima rodada tenta de novo
  *
- * Reenviar é seguro porque a chave de dedup do coletor usa o horário que o
- * E-MAIL declara, não a hora em que ele chegou lá. Se usasse a hora de chegada,
- * cada retentativa cairia num minuto diferente e o mesmo Pix entraria duas
- * vezes — o retry só é barato por causa disso.
+ * Reenviar em caso de 'erro' é seguro porque a chave de dedup do coletor usa o
+ * horário que o E-MAIL declara, não a hora em que ele chegou lá. Se usasse a
+ * hora de chegada, cada retentativa cairia num minuto diferente e o mesmo Pix
+ * entraria duas vezes — o retry só é barato por causa disso.
  */
 function enviar_(corpo) {
   var resp = UrlFetchApp.fetch(propriedade_('CAIXA_URL') + '/ingest/pix', {
@@ -121,19 +132,34 @@ function enviar_(corpo) {
   var codigo = resp.getResponseCode();
   var texto = resp.getContentText();
 
-  if (codigo === 200) {
-    Logger.log('enviado: ' + texto);
-    return true;
+  if (codigo !== 200) {
+    // 401 é erro de configuração, não de rede: reenviar mil vezes não conserta.
+    // Fica alto no log pra você achar rápido.
+    if (codigo === 401) {
+      Logger.log('ERRO 401 — INGEST_TOKEN não bate com o do servidor.');
+    } else {
+      Logger.log('ERRO HTTP ' + codigo + ': ' + texto);
+    }
+    return 'erro';
   }
 
-  // 401 é erro de configuração, não de rede: reenviar mil vezes não conserta.
-  // Fica alto no log pra você achar rápido.
-  if (codigo === 401) {
-    Logger.log('ERRO 401 — INGEST_TOKEN não bate com o do servidor.');
-  } else {
-    Logger.log('ERRO HTTP ' + codigo + ': ' + texto);
+  Logger.log('resposta: ' + texto);
+
+  var status;
+  try {
+    status = JSON.parse(texto).status;
+  } catch (e) {
+    // 200 com corpo que não é JSON não é o coletor respondendo — é proxy,
+    // página de erro ou redirect engolido. Trata como falha e retenta.
+    Logger.log('ERRO: resposta 200 mas ilegível — ' + e);
+    return 'erro';
   }
-  return false;
+
+  if (status === 'ignorado' || status === 'sem_valor') {
+    Logger.log('ATENÇÃO: o coletor NÃO reconheceu este e-mail como Pix. ' +
+               'Vai pra etiqueta "' + ETIQUETA_REVISAR + '".');
+  }
+  return status || 'erro';
 }
 
 
@@ -142,7 +168,6 @@ function enviar_(corpo) {
 // --------------------------------------------------------------------------
 
 function coletar() {
-  var etiqueta = etiqueta_();
   var threads = GmailApp.search(busca_(), 0, MAX_POR_RODADA);
   if (!threads.length) return;
 
@@ -150,23 +175,34 @@ function coletar() {
 
   for (var i = 0; i < threads.length; i++) {
     var msgs = threads[i].getMessages();
-    var todasOk = true;
+    var houveErro = false;
+    var houveNaoReconhecido = false;
 
     // Percorre todas as mensagens da conversa, não só a última: se o Gmail
     // agrupar dois comprovantes na mesma thread, etiquetar sem ler as duas
     // engoliria um Pix em silêncio.
     for (var j = 0; j < msgs.length; j++) {
+      var status;
       try {
-        if (!enviar_(texto_(msgs[j]))) todasOk = false;
+        status = enviar_(texto_(msgs[j]));
       } catch (e) {
         Logger.log('ERRO na mensagem: ' + e);
-        todasOk = false;
+        status = 'erro';
       }
+      if (status === 'erro') houveErro = true;
+      else if (status !== 'ok' && status !== 'duplicado') houveNaoReconhecido = true;
     }
 
-    // Etiqueta só a conversa inteiramente entregue. Falhou uma parte, volta
-    // tudo na próxima rodada — a dedup do coletor absorve o reenvio do resto.
-    if (todasOk) threads[i].addLabel(etiqueta);
+    // Erro manda a conversa INTEIRA de volta pra fila, sem etiqueta nenhuma: é
+    // o único caso em que o e-mail pode não ter chegado no servidor, e perder
+    // um Pix é pior que reenviar (a dedup absorve o reenvio do resto).
+    if (houveErro) continue;
+
+    // Chegou no servidor, mas alguma mensagem não virou Pix: vai pra fila de
+    // revisão em vez de sumir como se estivesse resolvida.
+    threads[i].addLabel(etiqueta_(
+      houveNaoReconhecido ? ETIQUETA_REVISAR : ETIQUETA_ENVIADO
+    ));
   }
 }
 
@@ -207,7 +243,11 @@ function testarBusca() {
     Logger.log(
       'Nenhuma. Ou não chegou comprovante novo, ou o REMETENTE/ASSUNTO não ' +
       'batem com o e-mail real, ou tudo já está etiquetado como "' +
-      NOME_ETIQUETA + '".'
+      ETIQUETA_ENVIADO + '" / "' + ETIQUETA_REVISAR + '".'
+    );
+    Logger.log(
+      'Pra reprocessar um e-mail já etiquetado, remova a etiqueta dele no ' +
+      'Gmail — a busca volta a enxergá-lo na rodada seguinte.'
     );
     return;
   }
@@ -238,13 +278,29 @@ function testarBusca() {
   Logger.log('===== CORPO INTEIRO =====\n' + corpo);
 }
 
-/** Envia UM e-mail de verdade pro caixa. Use depois do testarBusca(). */
+/**
+ * Envia UM e-mail de verdade pro caixa e diz o que aconteceu.
+ *
+ * Não etiqueta nada de propósito: é função de teste, e teste não pode marcar
+ * e-mail como processado. Quem etiqueta é o coletar().
+ */
 function testarEnvio() {
   var threads = GmailApp.search(busca_(), 0, 1);
   if (!threads.length) {
-    Logger.log('nada novo pra enviar — rode o testarBusca() primeiro');
+    Logger.log('nada novo pra enviar.');
+    Logger.log(
+      'Se você esperava um e-mail aqui, ele já está etiquetado: procure por ' +
+      'label:' + ETIQUETA_ENVIADO + ' ou label:' + ETIQUETA_REVISAR +
+      ' no Gmail. Remover a etiqueta devolve o e-mail pra fila.'
+    );
     return;
   }
-  var ok = enviar_(texto_(threads[0].getMessages()[0]));
-  Logger.log(ok ? 'ok — confira o painel' : 'falhou, veja o erro acima');
+
+  var status = enviar_(texto_(threads[0].getMessages()[0]));
+
+  if (status === 'ok') Logger.log('OK — o Pix tem que estar no painel agora.');
+  else if (status === 'duplicado') Logger.log('Já estava lá. A dedup funcionou.');
+  else if (status === 'erro') Logger.log('FALHOU — veja o erro acima.');
+  else Logger.log('O coletor respondeu "' + status + '": chegou no servidor, ' +
+                  'mas não virou Pix. O texto está no /brutos.');
 }
