@@ -1,14 +1,14 @@
 # Coletor de Pix
 
-Serviço independente. Recebe o e-mail de comprovante do PicPay (o n8n lê o
-Gmail e posta o corpo aqui), parseia, deduplica, grava em SQLite, empurra pro
-n8n e serve o painel.
+Serviço independente. Recebe o e-mail de comprovante do PicPay (um script na
+sua conta Google lê o Gmail e posta o corpo aqui), parseia, deduplica, grava em
+SQLite, serve o painel e — se você quiser — repassa pro n8n.
 
 Não compartilha código nem banco com a royal-loja.
 
 ```
-Gmail ──> n8n ──POST──> Coletor ──┬──> Painel (navegador)
-                                  └──> n8n ──> WhatsApp
+Gmail ──> Apps Script ──POST──> Coletor ──┬──> Painel (navegador)
+                                          └──> n8n ──> WhatsApp (opcional)
 ```
 
 > **Houve um segundo canal.** A notificação do app do Mercado Pago chegava pelo
@@ -54,7 +54,7 @@ SECRET_KEY=<primeiro token gerado>
 INGEST_TOKEN=<segundo token gerado>
 PAINEL_SENHA=<senha do painel>
 SENHA_BRUTOS=<segunda senha, só pra aba de não reconhecidas>
-N8N_WEBHOOK_URL=<url do webhook do n8n — pode deixar vazio por enquanto>
+N8N_WEBHOOK_URL=<opcional, só pra repassar o Pix adiante — pode deixar vazio>
 DB_PATH=/data/pix.db
 LIMITE_HEARTBEAT_MIN=60
 HORA_LIMPEZA=2
@@ -98,73 +98,106 @@ Depois abre `https://caixa.seudominio.com`, entra com a `PAINEL_SENHA`, e o
 Pix de teste tem que estar lá.
 
 **Só siga adiante se os três passos funcionarem.** Se algo falhar depois de
-ligar o n8n, você vai saber que o problema é no workflow.
+ligar o Gmail, você vai saber que o problema é no script, não no coletor.
 
 ---
 
-## 4. Ligar o Gmail — workflow de entrada no n8n
+## 4. Ligar o Gmail — Apps Script
 
-Workflow novo, separado do que consome o `N8N_WEBHOOK_URL`. Este aqui **entra**
-no caixa; o outro **sai** dele.
+A ponte é o `gmail-apps-script.gs` deste repositório. Ele roda **dentro da conta
+Google que recebe o comprovante**: procura e-mail novo de minuto em minuto,
+manda o corpo pro `/ingest/pix` e etiqueta o que já foi. Sem servidor pra manter
+e sem custo.
 
-### Node 1 — `Gmail Trigger`
+### 4.1. Criar o projeto
 
-| Campo | Valor |
+1. [script.google.com](https://script.google.com) → **Novo projeto**
+2. Renomeie pra `Coletor de Pix` (o nome aparece nos avisos de erro por e-mail)
+3. Apaga o `function myFunction() {}` e cola o conteúdo do
+   `gmail-apps-script.gs` inteiro
+
+**Faça isso logado na conta que recebe o e-mail do PicPay.** O script só
+enxerga o Gmail do dono dele — em outra conta ele roda liso e não acha nada.
+
+### 4.2. Guardar o domínio e o token
+
+**Configurações do projeto** (engrenagem) → **Propriedades do script** →
+**Adicionar propriedade**, duas vezes:
+
+| Propriedade | Valor |
 |---|---|
-| Credential | OAuth2 da conta que recebe o comprovante |
-| Poll Times | *Every Minute* |
-| Filters → Search | `from:(no-reply@picpay.com) subject:("Pagamento recebido via Pix")` |
-| Options → Download Attachments | desligado |
+| `CAIXA_URL` | `https://caixa.seudominio.com` (sem barra no fim) |
+| `INGEST_TOKEN` | o mesmo `INGEST_TOKEN` das variáveis do EasyPanel |
 
-**Confira o remetente real** abrindo um comprovante de verdade na sua caixa — o
-`no-reply@picpay.com` acima é chute. Filtro errado não dá erro em lugar nenhum:
-o canal simplesmente fica mudo. Aperte **Fetch Test Event** e olhe o output
-antes de seguir.
+Fora do código de propósito: assim o arquivo pode ser versionado e mostrado sem
+carregar o token do caixa junto.
 
-### Node 2 — achar o campo com o corpo
+### 4.3. Conferir o remetente
 
-No output do trigger, o corpo em texto puro costuma vir em `text` (com
-*Simplify* ligado, que é o padrão). Confirme o nome no seu n8n antes de
-referenciar.
+No topo do script, `REMETENTE` está como `no-reply@picpay.com` — **isso é
+chute**. Abre um comprovante de verdade na sua caixa e copia o endereço real.
+Filtro errado não dá erro em lugar nenhum: a ponte só fica muda.
 
-> **Nunca use `snippet`.** Ele é um resumo truncado em ~200 caracteres: o
-> `ID da transação` fica de fora e você perde a dedup por UUID justamente no
-> campo que ela existe pra proteger.
+Depois rode a função **`testarBusca`** (menu de funções → *Executar*). Na
+primeira execução o Google pede autorização: *Revisar permissões* → escolher a
+conta → *Avançado* → *Acessar Coletor de Pix (não seguro)* → *Permitir*. O aviso
+de "app não verificado" é esperado — o app não verificado é o seu próprio
+script.
 
-### Node 3 — `HTTP Request`
+O log tem que mostrar as primeiras linhas de um comprovante. Se disser
+`0 conversa(s) encontrada(s)`, é `REMETENTE`/`ASSUNTO` errado ou não chegou
+e-mail novo.
 
-| Campo | Valor |
-|---|---|
-| Method | POST |
-| URL | `https://caixa.seudominio.com/ingest/pix` |
-| Header | `Authorization: Bearer SEU_TOKEN` |
-| Body Content Type | *Raw* → `text/plain` |
-| Body | `{{ $json.text }}` |
+### 4.4. Enviar um de verdade
 
-Use `Authorization: Bearer`, **não** `X-Ingest-Token`: o Traefik do EasyPanel
-remove headers `X-` em requisição externa e você levaria 401 sem entender por
-quê. O token é o mesmo `INGEST_TOKEN` das variáveis de ambiente.
+Rode **`testarEnvio`**. O log deve mostrar `enviado: {"status":"ok",...}` e o
+Pix tem que aparecer no painel.
 
-### Testar de ponta a ponta
+Rode **de novo na mesma mensagem**: agora tem que vir `{"status":"duplicado"}` e
+nenhuma linha nova. Se criar linha nova, o UUID não está chegando e o corpo veio
+truncado.
 
-Manda um Pix de R$ 0,01 de outra conta pro seu PicPay e espera o e-mail. No
-painel tem que aparecer valor e nome. Se aparecer "Valor não lido", o texto cru
-está em `/brutos` — é de lá que sai o ajuste do regex.
+### 4.5. Ligar o automático
 
-Rode o workflow **duas vezes no mesmo e-mail** de propósito: a segunda tem que
-responder `{"status":"duplicado"}` e não criar linha nova. Se criar, o UUID não
-está chegando — provavelmente o corpo veio truncado.
+Rode **`instalarGatilho`** uma vez. Ele cria o disparo de 1 em 1 minuto (e
+remove um anterior, se houver, pra não empilhar).
 
-### Este workflow é a única ponte
+Confira em **Gatilhos** (ícone de relógio) que existe **um** gatilho de
+`coletar`. Em **Execuções** você vê cada rodada e o log dela — é o primeiro
+lugar pra olhar quando algo parar.
 
-Se ele for desativado, se a credencial do Gmail expirar ou se o n8n cair, **para
-tudo** e nada no painel grita. A única pista é a linha "Última atualização há X"
-envelhecendo. Vale conferir o workflow sempre que o painel passar uma manhã
-inteira quieto.
+### 4.6. Teste final, com dinheiro de verdade
+
+Manda R$ 0,01 de outra conta pro seu PicPay. Em até um minuto o painel apita.
+
+Se aparecer "Valor não lido", o texto cru está em `/brutos` — é de lá que sai o
+ajuste do regex, e **no mesmo dia**, porque às 2h ele é apagado.
+
+### Esta é a única ponte
+
+Se o gatilho for removido, se a autorização do script for revogada ou se o
+Google suspender o projeto por cota, **para tudo** — e nada no painel grita. A
+única pista é a linha "Última atualização há X" envelhecendo.
+
+Duas coisas que valem a pena saber antes de acontecerem:
+
+**O Google avisa por e-mail quando o gatilho falha.** Não ignore esse e-mail: em
+geral ele é o primeiro sinal de que a coleta parou.
+
+**Conta `@gmail.com` comum tem 90 minutos de execução por dia.** Rodando de
+minuto em minuto, uma rodada vazia gasta poucos segundos e o dia inteiro cabe —
+mas cabe sem folga larga. Se as Execuções começarem a acusar limite de cota,
+troque o `everyMinutes(1)` do `instalarGatilho` por `everyMinutes(5)` e rode a
+função de novo. Custa até 5 minutos de atraso no apito. Conta Workspace tem 6
+horas por dia e não chega perto disso.
 
 ---
 
-## 5. Ligar o n8n de saída
+## 5. Ligar o n8n de saída (opcional)
+
+Só serve pra repassar o Pix pra outro lugar — WhatsApp, planilha, o que for. O
+painel e o alerta sonoro funcionam sem isso; `N8N_WEBHOOK_URL` vazia
+simplesmente não dispara nada.
 
 Cria um workflow com gatilho **Webhook (POST)**, copia a URL e coloca em
 `N8N_WEBHOOK_URL`. O coletor dispara sozinho a cada Pix novo:
@@ -198,7 +231,7 @@ impede o Pix de ser gravado nem atrasa a resposta.
 | `/` | Painel (exige senha) |
 | `/brutos` | E-mails não reconhecidos — exige a senha do painel **e** a `SENHA_BRUTOS` |
 | `/saude` | Healthcheck, sem autenticação |
-| `/ingest/pix` | POST do n8n (exige token) |
+| `/ingest/pix` | POST do Apps Script (exige token) |
 | `/ingest/ping` | Heartbeat (exige token) |
 
 O desbloqueio de `/brutos` vale **15 minutos** e depois pede a senha de novo. É
@@ -206,8 +239,8 @@ de propósito: a sessão do painel dura 30 dias, e uma segunda senha que durasse
 mesmo não protegeria nada.
 
 `/ingest/ping` continua de pé, mas **ninguém bate nele hoje** — o relógio do
-painel anda pelos Pix que chegam. Ele fica disponível pra quando você quiser um
-agendamento no n8n mantendo o relógio vivo em hora parada (veja *Limites*).
+painel anda pelos Pix que chegam. Ele fica disponível pra quando você quiser
+manter o relógio vivo em hora parada (veja *Limites*).
 
 ---
 
@@ -369,10 +402,14 @@ Ele é guardado e fica visível, mas não aparece como Pix confirmado no painel.
 **Não é fonte de verdade.** É tela de conferência. O rodapé instrui a conferir no
 app em caso de dúvida ou valor alto — mantenha esse texto.
 
-**Canal único, e frágil em pontos que não são seus.** Gmail, credencial OAuth e
-n8n: qualquer um dos três parando derruba a coleta inteira. Não existe backup
-local como havia no celular — o e-mail continua na caixa, mas ninguém o lê
-sozinho depois.
+**Canal único, e frágil em pontos que não são seus.** Gmail, autorização do
+script e cota do Apps Script: qualquer um dos três parando derruba a coleta
+inteira. Não existe backup local como havia no celular — o e-mail continua na
+caixa, mas ninguém o lê sozinho depois.
+
+O consolo é que o e-mail **não se perde**: se a ponte ficou dias fora, é só
+tirar a etiqueta `caixa-enviado` das conversas e alargar o `newer_than` da busca
+que o script reenvia tudo. A dedup por UUID segura o que já tinha entrado.
 
 **O relógio mede venda, não ponte.** O ping só acontece quando chega e-mail. Não
 existe batida periódica, então **"Última atualização há 2 horas" pode ser tanto
@@ -384,9 +421,9 @@ maior hora morta normal da loja. Se a linha ficar âmbar todo dia sem motivo, o
 pessoal aprende a ignorá-la e você perde o aviso justamente no dia em que ele
 for verdadeiro. Suba o número antes que isso aconteça.
 
-Se um dia quiser o relógio medindo a ponte de verdade, é um *Schedule Trigger*
-de 10 minutos no n8n batendo em `/ingest/ping` — a rota já existe e já aceita o
-token.
+Se um dia quiser o relógio medindo a ponte de verdade, é uma função a mais no
+Apps Script batendo em `/ingest/ping` a cada 10 minutos — a rota já existe e já
+aceita o mesmo token.
 
 **O painel não grita.** Por decisão de projeto não existe faixa de alarme nem
 aviso de "ponte offline": a única pista é a linha **"Última atualização há X"**,
