@@ -223,8 +223,83 @@ def limpar_nome(n: str):
     return n[:60]
 
 
+# --------------------------------------------------------------------------
+# Parser do PicPay — segundo canal, via e-mail "Pagamento recebido via Pix".
+#
+# Formato da parte text/plain (já decodificada de quoted-printable):
+#
+#   Você recebeu um Pix de
+#   <NOME DO PAGADOR>
+#   Valor enviado
+#   R$ 0,35
+#   Detalhes do pagamento
+#   Data e hora
+#   05/08/2026às 13:16
+#   ID da transação
+#   019fd2b5-d600-7163-a294-5879de2a688d
+#
+# Os regex são ancorados no RÓTULO, nunca na posição da linha: o Gmail reflowa
+# o texto e cola pedaços ("2026às"). O \s* entre rótulo e valor atravessa a
+# quebra de linha, então funciona tanto com o dado na linha seguinte quanto na
+# mesma linha.
+# --------------------------------------------------------------------------
+
+PICPAY_ABERTURA = re.compile(r"voc[eê]\s+recebeu\s+um\s+pix\s+de", re.I)
+PICPAY_ROTULO_VALOR = re.compile(r"valor\s+enviado", re.I)
+
+PICPAY_NOME_RE = re.compile(
+    # Para no fim da linha OU no rótulo seguinte: se o Gmail juntar tudo numa
+    # linha só, o nome não engole o "Valor enviado R$ ..." que vem atrás.
+    r"voc[eê]\s+recebeu\s+um\s+pix\s+de\s*:?\s*(?P<nome>.{3,60}?)\s*(?=$|valor\s+enviado)",
+    re.I | re.M,
+)
+PICPAY_VALOR_RE = re.compile(
+    r"valor\s+enviado\s*:?\s*R\$\s*(?P<valor>\d[\d.]*(?:,\d{1,2})?)", re.I
+)
+PICPAY_UUID_RE = re.compile(
+    r"ID\s+da\s+transa[cç][aã]o\s*:?\s*"
+    r"(?P<uuid>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+    r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
+    re.I,
+)
+
+
+def e_picpay(bruto: str) -> bool:
+    """Só é PicPay se os DOIS marcadores existirem — evita casar com e-mail
+    de marketing que fale em Pix."""
+    return bool(PICPAY_ABERTURA.search(bruto) and PICPAY_ROTULO_VALOR.search(bruto))
+
+
+def parse_picpay(bruto: str):
+    """Retorna (centavos, pagador, status, transaction_id, canal)."""
+    m = PICPAY_UUID_RE.search(bruto)
+    transaction_id = m.group("uuid").lower() if m else None
+
+    mv = PICPAY_VALOR_RE.search(bruto)
+    if not mv:
+        # Sem fallback pro VALOR_RE genérico de propósito: o primeiro "R$" solto
+        # do e-mail pode ser tarifa ou promoção. Vira sem_valor, cai no /brutos
+        # com o texto inteiro e o regex se ajusta com o caso real na mão.
+        return None, None, "sem_valor", transaction_id, "picpay"
+
+    mn = PICPAY_NOME_RE.search(bruto)
+    # limpar_nome já derruba "Valor enviado" via LIXO_NOME, caso o nome falte.
+    nome = limpar_nome(mn.group("nome")) if mn else None
+
+    return para_centavos(mv.group("valor")), nome, "ok", transaction_id, "picpay"
+
+
 def parse(bruto: str):
-    """Retorna (centavos, pagador, status)."""
+    """Retorna (centavos, pagador, status, transaction_id, canal).
+
+    transaction_id só existe no canal PicPay, e nem sempre: e-mail truncado
+    pode chegar sem o UUID. Por isso o canal vem separado, e não deduzido de
+    `transaction_id is not None` — quem decide heartbeat e dedup precisa saber
+    a origem mesmo quando o UUID falta.
+    """
+    if e_picpay(bruto):
+        return parse_picpay(bruto)
+
     bruto = bruto.replace(">>>", " ").strip()
     if SEP in bruto:
         titulo, corpo = bruto.split(SEP, 1)
@@ -233,11 +308,11 @@ def parse(bruto: str):
     titulo, corpo = titulo.strip(), corpo.strip()
 
     if not TITULO_RECEBIDO.search(titulo):
-        return None, None, "ignorado"
+        return None, None, "ignorado", None, "mercadopago"
 
     mv = VALOR_RE.search(titulo) or VALOR_RE.search(corpo)
     if not mv:
-        return None, None, "sem_valor"
+        return None, None, "sem_valor", None, "mercadopago"
 
     nome = None
     for regex in NOME_RES:
@@ -247,7 +322,7 @@ def parse(bruto: str):
             if nome:
                 break
 
-    return para_centavos(mv.group("valor")), nome, "ok"
+    return para_centavos(mv.group("valor")), nome, "ok", None, "mercadopago"
 
 
 # --------------------------------------------------------------------------
@@ -314,10 +389,17 @@ def ingest_pix():
     if not texto:
         return jsonify(erro="texto vazio"), 400
 
-    centavos, pagador, status = parse(texto)
+    centavos, pagador, status, transaction_id, canal = parse(texto)
     agora = datetime.now(TZ)
 
-    if status == "ok":
+    # O UUID do PicPay é chave natural: identifica a transação, não o instante
+    # em que ela chegou aqui. Reenvio do mesmo e-mail duas horas depois cai no
+    # mesmo hash, coisa que a janela de um minuto do canal Android não pegaria.
+    # Vale inclusive no sem_valor: se o valor não foi lido mas o UUID veio, o
+    # /brutos não enche de cópias do mesmo e-mail.
+    if transaction_id:
+        chave = f"picpay|{transaction_id}"
+    elif status == "ok":
         chave = f"{centavos}|{(pagador or '').lower()}|{agora:%Y%m%d%H%M}"
     else:
         chave = f"raw|{texto}"
@@ -334,11 +416,17 @@ def ingest_pix():
         db.commit()
         novo_id = cur.lastrowid
     except sqlite3.IntegrityError:
-        registrar_ping()
+        if canal != "picpay":
+            registrar_ping()
         return jsonify(status="duplicado"), 200
 
-    registrar_ping()
-    log.info("pix %s | %s | %s", status, centavos, pagador)
+    # O heartbeat mede a ponte do celular e mais nada. Se o PicPay pingasse, o
+    # painel — que agrega as pontes de forma otimista — mostraria "atualizado
+    # agora" com o celular morto há horas. Prefere-se o painel envelhecer à
+    # vista de todos a ele afirmar que está tudo em dia.
+    if canal != "picpay":
+        registrar_ping()
+    log.info("pix %s | %s | %s | %s", canal, status, centavos, pagador)
 
     if status == "ok":
         avisar_n8n({
@@ -348,9 +436,11 @@ def ingest_pix():
             "pagador": pagador,
             "recebido_em": agora.isoformat(),
             "hora": agora.strftime("%H:%M"),
+            "canal": canal,
+            "transaction_id": transaction_id,
         })
 
-    return jsonify(status=status, valor=centavos, pagador=pagador), 200
+    return jsonify(status=status, valor=centavos, pagador=pagador, canal=canal), 200
 
 
 @app.post("/ingest/ping")

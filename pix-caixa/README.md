@@ -281,13 +281,101 @@ Ela é guardada e fica visível, mas não aparece como Pix confirmado no painel.
 
 ---
 
+## 10. Segundo canal: PicPay por e-mail
+
+O Mercado Pago entra por notificação do Android. O PicPay entra pelo e-mail
+"Pagamento recebido via Pix", encaminhado para o mesmo `POST /ingest/pix`, com o
+mesmo token. Não há rota nova nem token novo: o `parse()` reconhece o formato
+sozinho e desvia.
+
+### Como o canal é reconhecido
+
+Só vira PicPay se **os dois** marcadores existirem no texto: `Você recebeu um
+Pix de` **e** `Valor enviado`. Um marcador só não basta — e-mail de marketing
+fala em Pix o tempo todo.
+
+### Por que os regex são ancorados no rótulo
+
+O corpo `text/plain` chega assim:
+
+```
+Você recebeu um Pix de
+JOAO DA SILVA SANTOS
+Valor enviado
+R$ 0,35
+Detalhes do pagamento
+Data e hora
+05/08/2026às 13:16
+ID da transação
+019fd2b5-d600-7163-a294-5879de2a688d
+```
+
+Mas o Gmail reflowa: junta linhas, cola pedaços (`2026às`). Por isso nenhum
+regex conta linhas ou posições — cada um procura o **rótulo** e pega o que vem
+depois, atravessando ou não a quebra de linha. O mesmo e-mail linha a linha ou
+espremido numa linha só dá o mesmo resultado.
+
+O valor sai de `Valor enviado`, nunca do primeiro `R$` do texto: o primeiro
+`R$` solto pode ser tarifa ou promoção. Se o rótulo faltar, vira `sem_valor` e
+cai no `/brutos` com o texto inteiro — aí o regex se ajusta com o caso real na
+mão, em vez de chutar.
+
+### Dedup pelo ID da transação
+
+O canal Android deduplica por `valor + nome + minuto` — não tem identificador,
+então usa o instante. O PicPay tem: o UUID do `ID da transação` vira a chave
+(`picpay|<uuid>`), o que identifica a **transação**, não a hora em que ela
+chegou aqui. Reenvio do mesmo e-mail duas horas depois cai no mesmo hash e não
+duplica; a janela de um minuto do Android não pegaria isso.
+
+Vale também no `sem_valor`: se o valor não foi lido mas o UUID veio, o
+`/brutos` não enche de cópias do mesmo e-mail. E-mail sem UUID cai no critério
+antigo de valor + nome + minuto.
+
+Nada disso mexeu no banco — o UUID entra no `dedup_hash` que já existia, e a
+`UNIQUE` da tabela faz o resto. Não há coluna nova nem migração.
+
+### O PicPay não registra heartbeat — de propósito
+
+O relógio "Última atualização há X" mede **a ponte do celular**, e só. Se o
+PicPay pingasse, o painel — que agrega as pontes de forma otimista — mostraria
+"agora mesmo" com o celular morto há horas.
+
+O efeito colateral é conhecido e foi aceito: **com o celular fora do ar e só o
+PicPay entrando, o painel envelhece e vira âmbar mesmo com dinheiro chegando.**
+Isso é ruído, mas é ruído honesto — melhor do que a tela afirmar que está tudo
+em dia quando metade da operação parou.
+
+### No n8n
+
+O webhook dispara igual para os dois canais, com dois campos a mais no payload:
+`canal` (`"mercadopago"` ou `"picpay"`) e `transaction_id` (`null` fora do
+PicPay). Campo novo não quebra fluxo existente; serve pra rotear por canal se
+um dia precisar.
+
+### Armadilha: filtre no lado do e-mail
+
+A lista branca do canal Android é ampla de propósito — qualquer título com
+"receb" e um `R$` vira recebimento. Isso funcionava porque só notificação do
+app do MP chegava ali. Com o e-mail no meio, **um e-mail promocional do PicPay
+que diga "você recebeu" e cite um `R$` pode virar um Pix falso no painel.**
+
+Ele não passa no reconhecimento do PicPay (falta `Valor enviado`), mas cai no
+parser antigo. A defesa é no transporte, não aqui: encaminhe para o
+`/ingest/pix` **só** os e-mails que casem com remetente e assunto do
+comprovante — nunca a caixa inteira.
+
+---
+
 ## Limites conhecidos
 
 **Não é fonte de verdade.** É tela de conferência. O rodapé instrui a conferir no
 app do MP em caso de dúvida ou valor alto — mantenha esse texto.
 
-**Canal único.** Se o celular desligar, travar ou perder o wi-fi, para tudo. O
-arquivo local guarda o que não foi enviado.
+**Mercado Pago depende do celular.** Se ele desligar, travar ou perder o wi-fi,
+o canal do MP para — o PicPay, que entra por e-mail, continua. O arquivo local
+guarda o que não foi enviado. E como o PicPay não registra heartbeat, o painel
+continua envelhecendo e avisando que o celular caiu.
 
 **O painel não grita.** Por decisão de projeto não existe faixa de alarme nem
 aviso de "ponte offline": a única pista de que o celular parou é a linha
