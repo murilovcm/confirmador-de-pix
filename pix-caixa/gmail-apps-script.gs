@@ -180,8 +180,13 @@ function instalarGatilho() {
 /**
  * Confere a configuração sem mandar nada pro caixa.
  *
- * Mostra quantos e-mails a busca acha e as primeiras linhas do mais recente —
- * é onde você descobre que o REMETENTE está errado antes de culpar o parser.
+ * Responde antes de tudo a única pergunta que importa: ESTE e-mail passaria na
+ * lista branca do coletor? Os dois testes abaixo são cópia da regra do
+ * servidor (`e_picpay` no app.py) — existem pra dar o veredito aqui, do lado do
+ * Gmail, sem precisar mandar nada e ir garimpar no /brutos depois.
+ *
+ * O corpo inteiro vem no fim, e não no começo, pra o veredito não ficar
+ * enterrado embaixo de 2 KB de rodapé.
  */
 function testarBusca() {
   Logger.log('busca: ' + busca_());
@@ -200,7 +205,23 @@ function testarBusca() {
   var msg = threads[0].getMessages()[0];
   Logger.log('de: ' + msg.getFrom());
   Logger.log('assunto: ' + msg.getSubject());
-  Logger.log('--- corpo ---\n' + texto_(msg).slice(0, 600));
+
+  var corpo = texto_(msg);
+  var uuid = corpo.match(
+    /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i
+  );
+  var valores = corpo.match(/R\$\s*[\d.,]+/g);
+
+  Logger.log('===== VEREDITO =====');
+  Logger.log('tamanho do corpo: ' + corpo.length + ' caracteres');
+  Logger.log('marcador 1 "Você recebeu um Pix de": ' +
+             (/voc[eê]\s+recebeu\s+um\s+pix\s+de/i.test(corpo) ? 'ACHOU' : 'NAO ACHOU'));
+  Logger.log('marcador 2 "Valor enviado": ' +
+             (/valor\s+enviado/i.test(corpo) ? 'ACHOU' : 'NAO ACHOU'));
+  Logger.log('ID da transação: ' + (uuid ? uuid[0] : 'NAO ACHOU'));
+  Logger.log('valores R$ no texto: ' + (valores ? valores.join('  |  ') : 'nenhum'));
+  Logger.log('Os dois marcadores precisam dar ACHOU, senão o coletor ignora.');
+  Logger.log('===== CORPO INTEIRO =====\n' + corpo);
 }
 
 /** Envia UM e-mail de verdade pro caixa. Use depois do testarBusca(). */
