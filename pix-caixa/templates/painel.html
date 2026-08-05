@@ -49,6 +49,15 @@
   footer{margin-top:28px;padding-top:18px;border-top:1px solid var(--linha);color:var(--txt2);font-size:12.5px;line-height:1.55;text-align:center}
   .som{background:none;border:1px solid var(--linha);color:var(--txt2);border-radius:9999px;padding:9px 18px;font-size:13px;cursor:pointer;margin-top:14px}
   .som.on{border-color:var(--accent);color:var(--accent)}
+
+  /* Volume do alerta. Polegar de balcao, nao mouse: trilho e botao grandes. */
+  .vol{display:flex;align-items:center;justify-content:center;gap:12px;margin-top:16px;font-size:15px}
+  .vol input[type=range]{-webkit-appearance:none;appearance:none;width:190px;height:28px;background:none;cursor:pointer}
+  .vol input[type=range]::-webkit-slider-runnable-track{height:6px;border-radius:9999px;background:var(--linha)}
+  .vol input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:26px;height:26px;margin-top:-10px;border-radius:50%;background:var(--accent);border:none}
+  .vol input[type=range]::-moz-range-track{height:6px;border-radius:9999px;background:var(--linha)}
+  .vol input[type=range]::-moz-range-thumb{width:26px;height:26px;border:none;border-radius:50%;background:var(--accent)}
+  .vol b{font-variant-numeric:tabular-nums;color:var(--txt);font-weight:600;min-width:46px;text-align:left;font-size:13px}
   .aviso.morno{background:rgba(255,176,32,.12);border-color:#FFB020;color:#FFD79A}
 
   /* Painel do teste de alerta sonoro */
@@ -90,6 +99,12 @@
   Em caso de dúvida ou valor alto, sempre confirmar no grupo de WhatsAPP da loja antes de entregar o produto.
   <br><button class="som" id="som">🔔 Ativar som</button>
   <button class="som" id="testar">▶ Testar alerta</button>
+  <div class="vol">
+    <span>🔈</span>
+    <input type="range" id="volume" min="20" max="100" step="10" value="100"
+           aria-label="Volume do alerta">
+    <span>🔊</span><b id="volPct">100%</b>
+  </div>
   <div class="teste" id="teste" hidden></div>
   <br><br><a href="/brutos">Notificações não reconhecidas</a>
 </footer>
@@ -104,15 +119,52 @@ let vistos = new Set(), primeira = true, ctx = null;
 const SOM_CHAVE = 'caixa:som';
 let somOn = localStorage.getItem(SOM_CHAVE) === '1';
 
+// Volume tambem sobrevive ao reload, pelo mesmo motivo do liga/desliga: um
+// tablet que reinicia no meio do expediente nao pode voltar mais baixo do que
+// o pessoal deixou, porque ninguem percebe um som mais fraco.
+//
+// Comeca no MAXIMO. O padrao antigo era baixo demais pra balcao com movimento,
+// e o lado seguro pra errar aqui e o alto: alerta alto demais alguem abaixa,
+// alerta baixo demais ninguem escuta e o Pix fica sem conferir.
+//
+// O minimo e 20%, nao 0. Zero seria um segundo botao de mudo escondido dentro
+// do volume, discordando do 🔔 logo acima — dois controles pra mesma coisa e
+// receita de "o som some e ninguem sabe qual dos dois desligou".
+const VOL_CHAVE = 'caixa:volume';
+const volSalvo = parseInt(localStorage.getItem(VOL_CHAVE), 10);
+let volume = (volSalvo >= 20 && volSalvo <= 100) ? volSalvo / 100 : 1;
+
 const btnSom = document.getElementById('som');
 const btnTestar = document.getElementById('testar');
 const boxTeste = document.getElementById('teste');
+const barraVol = document.getElementById('volume');
+const txtVol = document.getElementById('volPct');
 let sumirTeste = null;
 
 function pintaSom(){
   btnSom.classList.toggle('on', somOn);
   btnSom.textContent = somOn ? '🔔 Som ativado' : '🔔 Ativar som';
 }
+
+function pintaVolume(){
+  barraVol.value = Math.round(volume * 100);
+  txtVol.textContent = Math.round(volume * 100) + '%';
+}
+
+// Enquanto arrasta, so atualiza o numero. O bip de amostra vem no 'change',
+// ou seja, ao SOLTAR: tocar a cada passo do arrasto viraria uma metralhadora.
+barraVol.addEventListener('input', () => {
+  volume = barraVol.value / 100;
+  txtVol.textContent = barraVol.value + '%';
+});
+
+barraVol.addEventListener('change', () => {
+  volume = barraVol.value / 100;
+  localStorage.setItem(VOL_CHAVE, barraVol.value);
+  // Amostra so se o som estiver ligado — mexer no volume nao liga o alerta
+  // sozinho. Quem liga e o botao, que avisa na tela que ligou.
+  if (somOn) garanteCtx().resume().then(bip);
+});
 
 function garanteCtx(){
   ctx = ctx || new (window.AudioContext||window.webkitAudioContext)();
@@ -200,6 +252,7 @@ function mostraChecklist(){
   titulo.textContent = 'Sem som. Confira nesta ordem:';
   const lista = document.createElement('ul');
   [
+    'A barra de volume aqui embaixo — pode ter sido arrastada pra baixo',
     'Volume da mídia no máximo — o botão lateral costuma mexer só na campainha',
     'Modo silencioso e Não perturbe desligados',
     'Nenhum fone ou caixa Bluetooth conectado levando o som pra longe',
@@ -219,18 +272,34 @@ function mostraChecklist(){
 }
 
 pintaSom();
+pintaVolume();
 if (somOn){ garanteCtx().resume().then(revisaBloqueio).catch(revisaBloqueio); }
+
+// O bip ficou MUITO mais alto, e por dois motivos somados:
+//
+// 1. Onda quadrada no lugar da senoide. A senoide e uma frequencia pura e some
+//    no barulho da loja; a quadrada carrega harmonicos que cortam o ruido e
+//    atravessam o alto-falante pequeno do tablet, que quase nao reproduz grave.
+//    Na pratica soa varias vezes mais alta com o mesmo ganho.
+// 2. Pico de .25 para .55 no volume maximo — mais que o dobro da amplitude.
+//
+// O teto de .55 nao e timidez: as duas notas se sobrepoem por 100ms, entao o
+// pico somado chega perto de 1.1. Passar disso satura a saida e o bip vira
+// chiado — que ate parece mais alto, mas soa quebrado e some no ruido.
+const PICO = .55;
 
 function bip(){
   if (!ctx) return;
   [880, 1320].forEach((hz, i) => {
     const o = ctx.createOscillator(), g = ctx.createGain();
-    o.frequency.value = hz; o.type = 'sine';
-    g.gain.setValueAtTime(.0001, ctx.currentTime + i*.14);
-    g.gain.exponentialRampToValueAtTime(.25, ctx.currentTime + i*.14 + .02);
-    g.gain.exponentialRampToValueAtTime(.0001, ctx.currentTime + i*.14 + .22);
+    o.frequency.value = hz; o.type = 'square';
+    const t = ctx.currentTime + i*.14;
+    // exponentialRamp nao aceita destino zero: dai o .0001 nas pontas.
+    g.gain.setValueAtTime(.0001, t);
+    g.gain.exponentialRampToValueAtTime(PICO * volume, t + .02);
+    g.gain.exponentialRampToValueAtTime(.0001, t + .22);
     o.connect(g); g.connect(ctx.destination);
-    o.start(ctx.currentTime + i*.14); o.stop(ctx.currentTime + i*.14 + .24);
+    o.start(t); o.stop(t + .24);
   });
 }
 
