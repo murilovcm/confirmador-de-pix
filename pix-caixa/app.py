@@ -1,14 +1,14 @@
 """
 Coletor de Pix — serviço independente.
 
-Recebe o e-mail "Pagamento recebido via Pix" do PicPay (o n8n lê o Gmail e
-posta o corpo aqui), parseia, deduplica, grava em SQLite, empurra para o n8n e
-serve o dashboard.
+Recebe o e-mail "Você recebeu uma transferência via Pix" do Nubank (um Apps
+Script lê o Gmail e posta o corpo aqui), parseia, deduplica, grava em SQLite,
+empurra para o n8n e serve o dashboard.
 
-Havia um segundo canal — notificação do app do Mercado Pago via MacroDroid no
-celular — aposentado quando a operação passou a ser só PicPay. O parser daquele
-formato saiu junto: código morto que sabe transformar texto em dinheiro é
-risco, não conveniência. Está no histórico do git se um dia voltar.
+Já passaram por aqui dois canais aposentados: notificação do app do Mercado
+Pago via MacroDroid no celular, e o e-mail do PicPay. Os parsers dos dois
+saíram junto com eles — código morto que sabe transformar texto em dinheiro é
+risco, não conveniência. Estão no histórico do git se um dia voltarem.
 
 Não compartilha código nem banco com a royal-loja.
 """
@@ -60,7 +60,7 @@ VALIDADE_BRUTOS_MIN = 15
 # Marcador de build — serve pra provar qual versão do código está rodando
 # no container. Bumpar a cada deploy que precise ser verificado.
 # TEMPORÁRIO: remover junto com /saude/headers quando o 401 estiver resolvido.
-VERSAO = "so-picpay-1"
+VERSAO = "nubank-1"
 
 
 # --------------------------------------------------------------------------
@@ -217,81 +217,102 @@ def limpar_nome(n: str):
 
 
 # --------------------------------------------------------------------------
-# Parser — e-mail do PicPay, "Pagamento recebido via Pix".
+# Parser — e-mail do Nubank, "Você recebeu uma transferência via Pix".
 #
 # LISTA BRANCA: só vira dinheiro o texto que casar com os DOIS marcadores do
 # comprovante. Qualquer outra coisa é guardada em /brutos e nunca conta como
-# recebimento — inclusive o promocional do próprio PicPay, que fala em Pix e
-# cita "R$" o tempo todo.
+# recebimento — e isso importa mais aqui do que importava no PicPay, porque
+# metade deste e-mail é propaganda: o bloco "Com o Nubank, você tem mais
+# praticidade na hora de fazer um Pix" cita Pix cinco vezes e nenhuma delas é
+# dinheiro entrando.
 #
-# Formato da parte text/plain (já decodificada de quoted-printable):
+# ATENÇÃO — este e-mail é text/html PURO, sem parte text/plain. O texto que
+# chega aqui é o HTML já achatado pela ponte, e por isso a quebra de linha não
+# é confiável: depende de como cada <br> e </p> foram traduzidos. Todos os
+# regex atravessam quebra de linha de propósito.
 #
-#   Você recebeu um Pix de
-#   <NOME DO PAGADOR>
-#   Valor enviado
-#   R$ 0,35
-#   Detalhes do pagamento
-#   Data e hora
-#   05/08/2026às 13:16
-#   ID da transação
-#   019fd2b5-d600-7163-a294-5879de2a688d
+# Formato, depois de achatado:
 #
-# Os regex são ancorados no RÓTULO, nunca na posição da linha: o Gmail reflowa
-# o texto e cola pedaços ("2026às"). O \s* entre rótulo e valor atravessa a
-# quebra de linha, então funciona tanto com o dado na linha seguinte quanto na
-# mesma linha.
+#   Pix recebido com sucesso.
+#   Olá, <SEU NOME>.
+#   Você recebeu um Pix de <NOME DO PAGADOR> e o valor já está disponível
+#   na sua conta do Nubank.
+#   Valor Recebido:
+#   R$ 0,02
+#   05 AGO às 18:51
+#
+# NÃO EXISTE identificador da transação neste e-mail — nem UUID, nem número de
+# comprovante, nada. Foi procurado no fonte cru inteiro. É por isso que a dedup
+# depende de valor + nome + horário; veja o comentário em ingest_pix.
 # --------------------------------------------------------------------------
 
-PICPAY_ABERTURA = re.compile(r"voc[eê]\s+recebeu\s+um\s+pix\s+de", re.I)
-PICPAY_ROTULO_VALOR = re.compile(r"valor\s+enviado", re.I)
+NUBANK_ABERTURA = re.compile(r"voc[eê]\s+recebeu\s+um\s+pix\s+de", re.I)
+NUBANK_ROTULO_VALOR = re.compile(r"valor\s+recebido", re.I)
 
-PICPAY_NOME_RE = re.compile(
-    # Para no fim da linha OU no rótulo seguinte: se o Gmail juntar tudo numa
-    # linha só, o nome não engole o "Valor enviado R$ ..." que vem atrás.
-    r"voc[eê]\s+recebeu\s+um\s+pix\s+de\s*:?\s*(?P<nome>.{3,60}?)\s*(?=$|valor\s+enviado)",
-    re.I | re.M,
+NUBANK_NOME_RES = [
+    # O nome vem no meio da frase, terminado por " e o valor". Non-greedy pra
+    # parar no PRIMEIRO "e o valor" e não engolir a frase inteira.
+    re.compile(
+        r"voc[eê]\s+recebeu\s+um\s+pix\s+de\s+(?P<nome>.{3,60}?)\s+e\s+o\s+valor\b",
+        re.I | re.S,
+    ),
+    # Reserva, caso o Nubank passe a quebrar linha depois do nome como o PicPay
+    # fazia. Sem isso, uma mudança de layout derrubaria o nome em silêncio.
+    re.compile(
+        r"voc[eê]\s+recebeu\s+um\s+pix\s+de\s*:?\s*(?P<nome>.{3,60}?)\s*(?=$|valor\s+recebido)",
+        re.I | re.M,
+    ),
+]
+
+NUBANK_VALOR_RE = re.compile(
+    r"valor\s+recebido\s*:?\s*R\$\s*(?P<valor>\d[\d.]*(?:,\d{1,2})?)", re.I
 )
-PICPAY_VALOR_RE = re.compile(
-    r"valor\s+enviado\s*:?\s*R\$\s*(?P<valor>\d[\d.]*(?:,\d{1,2})?)", re.I
-)
-PICPAY_UUID_RE = re.compile(
-    r"ID\s+da\s+transa[cç][aã]o\s*:?\s*"
-    r"(?P<uuid>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
-    r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
+
+# O horário que o PRÓPRIO e-mail declara ("05 AGO às 18:51"), ancorado logo
+# depois do valor pra não casar com data de rodapé. Ele é a peça que faz a
+# dedup sobreviver a reenvio: veja ingest_pix.
+NUBANK_QUANDO_RE = re.compile(
+    r"valor\s+recebido\s*:?\s*R\$\s*[\d.,]+\s*"
+    r"(?P<quando>\d{1,2}\s+\w{3,}\s+[àa]s\s+\d{1,2}:\d{2})",
     re.I,
 )
 
 
-def e_picpay(bruto: str) -> bool:
-    """Só é PicPay se os DOIS marcadores existirem — evita casar com e-mail
-    de marketing que fale em Pix."""
-    return bool(PICPAY_ABERTURA.search(bruto) and PICPAY_ROTULO_VALOR.search(bruto))
+def e_nubank(bruto: str) -> bool:
+    """Só é comprovante se os DOIS marcadores existirem — o promocional do
+    próprio Nubank fala em Pix o tempo todo e não pode virar dinheiro."""
+    return bool(NUBANK_ABERTURA.search(bruto) and NUBANK_ROTULO_VALOR.search(bruto))
 
 
 def parse(bruto: str):
-    """Retorna (centavos, pagador, status, transaction_id).
+    """Retorna (centavos, pagador, status, quando).
 
-    transaction_id é o UUID do comprovante — falta quando o e-mail chega
-    truncado, e aí a dedup cai no critério de valor + nome + minuto.
+    `quando` é o horário que o e-mail declara, em texto cru ("05 AGO às
+    18:51"), não convertido: ele só serve de chave de dedup, e converter só
+    criaria um jeito novo de falhar.
     """
-    if not e_picpay(bruto):
+    if not e_nubank(bruto):
         return None, None, "ignorado", None
 
-    m = PICPAY_UUID_RE.search(bruto)
-    transaction_id = m.group("uuid").lower() if m else None
+    mq = NUBANK_QUANDO_RE.search(bruto)
+    quando = " ".join(mq.group("quando").split()) if mq else None
 
-    mv = PICPAY_VALOR_RE.search(bruto)
+    mv = NUBANK_VALOR_RE.search(bruto)
     if not mv:
         # Sem fallback pro primeiro "R$" solto do texto, de propósito: ele pode
         # ser tarifa ou promoção. Vira sem_valor, cai no /brutos com o texto
         # inteiro e o regex se ajusta com o caso real na mão.
-        return None, None, "sem_valor", transaction_id
+        return None, None, "sem_valor", quando
 
-    mn = PICPAY_NOME_RE.search(bruto)
-    # limpar_nome já derruba "Valor enviado" via LIXO_NOME, caso o nome falte.
-    nome = limpar_nome(mn.group("nome")) if mn else None
+    nome = None
+    for regex in NUBANK_NOME_RES:
+        m = regex.search(bruto)
+        if m:
+            nome = limpar_nome(m.group("nome"))
+            if nome:
+                break
 
-    return para_centavos(mv.group("valor")), nome, "ok", transaction_id
+    return para_centavos(mv.group("valor")), nome, "ok", quando
 
 
 # --------------------------------------------------------------------------
@@ -358,17 +379,25 @@ def ingest_pix():
     if not texto:
         return jsonify(erro="texto vazio"), 400
 
-    centavos, pagador, status, transaction_id = parse(texto)
+    centavos, pagador, status, quando = parse(texto)
     agora = datetime.now(TZ)
 
-    # O UUID do comprovante é chave natural: identifica a transação, não o
-    # instante em que ela chegou aqui. Reenvio do mesmo e-mail duas horas depois
-    # cai no mesmo hash. Vale inclusive no sem_valor: se o valor não foi lido
-    # mas o UUID veio, o /brutos não enche de cópias do mesmo e-mail.
-    if transaction_id:
-        chave = f"picpay|{transaction_id}"
-    elif status == "ok":
-        chave = f"{centavos}|{(pagador or '').lower()}|{agora:%Y%m%d%H%M}"
+    # DEDUP — o e-mail do Nubank não traz identificador de transação nenhum, e a
+    # chave é valor + nome + horário. Decisão consciente, com o custo anotado
+    # nos Limites do README: dois Pix do MESMO pagador, MESMO valor e MESMO
+    # minuto viram uma linha só, e o segundo é descartado.
+    #
+    # O horário usado é o que o E-MAIL declara, não o instante em que ele
+    # chegou aqui. Isso não é detalhe: a ponte reenvia o e-mail quando o POST
+    # falha, e como ela roda de minuto em minuto, `agora` mudaria entre a
+    # primeira tentativa e a segunda — a chave mudaria junto e o mesmo Pix
+    # entraria duas vezes. Com o horário do e-mail, a chave é a mesma sempre.
+    #
+    # `agora` só entra se o e-mail vier sem horário legível, e aí volta o risco
+    # de duplicata no reenvio — é o menos ruim entre não deduplicar nada.
+    if status == "ok":
+        referencia = quando or f"{agora:%Y%m%d%H%M}"
+        chave = f"{centavos}|{(pagador or '').lower()}|{referencia}"
     else:
         chave = f"raw|{texto}"
     dedup = hashlib.sha256(chave.encode("utf-8")).hexdigest()
@@ -384,8 +413,13 @@ def ingest_pix():
         db.commit()
         novo_id = cur.lastrowid
     except sqlite3.IntegrityError:
-        # Duplicado também prova que a ponte está viva — e-mail repetido é o n8n
-        # funcionando, não parado.
+        # Sem identificador de transação, "duplicado" é um palpite: quase sempre
+        # é o mesmo e-mail reenviado, mas pode ser um Pix real do mesmo pagador,
+        # mesmo valor e mesmo minuto sendo descartado. Fica no log com valor e
+        # nome pra dar o que conferir quando o fechamento não bater — é o único
+        # rastro que esse caso deixa.
+        log.warning("duplicado descartado | %s | %s | %s", centavos, pagador, quando)
+        # Duplicado também prova que a ponte está viva.
         registrar_ping()
         return jsonify(status="duplicado"), 200
 
@@ -405,8 +439,7 @@ def ingest_pix():
             "pagador": pagador,
             "recebido_em": agora.isoformat(),
             "hora": agora.strftime("%H:%M"),
-            "canal": "picpay",
-            "transaction_id": transaction_id,
+            "canal": "nubank",
         })
 
     return jsonify(status=status, valor=centavos, pagador=pagador), 200

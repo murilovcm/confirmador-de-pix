@@ -1,6 +1,6 @@
 # Coletor de Pix
 
-Serviço independente. Recebe o e-mail de comprovante do PicPay (um script na
+Serviço independente. Recebe o e-mail de comprovante do Nubank (um script na
 sua conta Google lê o Gmail e posta o corpo aqui), parseia, deduplica, grava em
 SQLite, serve o painel e — se você quiser — repassa pro n8n.
 
@@ -11,11 +11,11 @@ Gmail ──> Apps Script ──POST──> Coletor ──┬──> Painel (nav
                                           └──> n8n ──> WhatsApp (opcional)
 ```
 
-> **Houve um segundo canal.** A notificação do app do Mercado Pago chegava pelo
-> MacroDroid no celular. Foi aposentado quando a operação passou a ser só
-> PicPay, e o parser daquele formato saiu junto — código morto que sabe
-> transformar texto em dinheiro é risco, não conveniência. Está no histórico do
-> git se um dia voltar.
+> **Dois canais já foram aposentados aqui.** A notificação do app do Mercado
+> Pago, que chegava pelo MacroDroid no celular, e o e-mail do PicPay. Os
+> parsers dos dois saíram junto com eles — código morto que sabe transformar
+> texto em dinheiro é risco, não conveniência. Estão no histórico do git se um
+> dia voltarem.
 
 ---
 
@@ -78,7 +78,7 @@ curl -i -X POST https://caixa.seudominio.com/ingest/pix --data "teste"
 curl -X POST https://caixa.seudominio.com/ingest/pix \
   -H "Authorization: Bearer SEU_TOKEN" \
   -H "Content-Type: text/plain" \
-  --data $'Você recebeu um Pix de\nTESTE DA SILVA\nValor enviado\nR$ 12,34\nID da transação\n019fd2b5-d600-7163-a294-5879de2a688d'
+  --data $'Você recebeu um Pix de TESTE DA SILVA e o valor já está disponível na sua conta do Nubank.\nValor Recebido:\nR$ 12,34\n05 AGO às 18:51'
 ```
 
 Esperado no passo 3:
@@ -88,7 +88,9 @@ Esperado no passo 3:
 ```
 
 Repita o passo 3 **igualzinho**: a segunda vez tem que responder
-`{"status":"duplicado"}`. É a dedup por UUID funcionando.
+`{"status":"duplicado"}`. É a dedup funcionando — e repare que ela só dá certo
+porque o horário vem no próprio texto (`05 AGO às 18:51`). Troque esse horário
+e o mesmo comando cria uma linha nova.
 
 No passo 1, confira também o campo `versao` — é o que prova qual código está
 rodando no container. Se ele não bateu com o que você acabou de subir, o deploy
@@ -116,7 +118,7 @@ e sem custo.
 3. Apaga o `function myFunction() {}` e cola o conteúdo do
    `gmail-apps-script.gs` inteiro
 
-**Faça isso logado na conta que recebe o e-mail do PicPay.** O script só
+**Faça isso logado na conta que recebe o e-mail do Nubank.** O script só
 enxerga o Gmail do dono dele — em outra conta ele roda liso e não acha nada.
 
 ### 4.2. Guardar o domínio e o token
@@ -132,21 +134,29 @@ enxerga o Gmail do dono dele — em outra conta ele roda liso e não acha nada.
 Fora do código de propósito: assim o arquivo pode ser versionado e mostrado sem
 carregar o token do caixa junto.
 
-### 4.3. Conferir o remetente
+### 4.3. Conferir o filtro
 
-No topo do script, `REMETENTE` está como `no-reply@picpay.com` — **isso é
-chute**. Abre um comprovante de verdade na sua caixa e copia o endereço real.
-Filtro errado não dá erro em lugar nenhum: a ponte só fica muda.
+`REMETENTE` e `ASSUNTO` já vêm com os valores reais do Nubank
+(`todomundo@nubank.com.br` / `Você recebeu uma transferência via Pix`),
+conferidos no fonte de um comprovante de verdade. Se um dia a ponte ficar muda,
+é aqui que se olha primeiro — filtro errado não dá erro em lugar nenhum.
 
-Depois rode a função **`testarBusca`** (menu de funções → *Executar*). Na
-primeira execução o Google pede autorização: *Revisar permissões* → escolher a
-conta → *Avançado* → *Acessar Coletor de Pix (não seguro)* → *Permitir*. O aviso
-de "app não verificado" é esperado — o app não verificado é o seu próprio
-script.
+Rode a função **`testarBusca`** (menu de funções → *Executar*). Na primeira
+execução o Google pede autorização: *Revisar permissões* → escolher a conta →
+*Avançado* → *Acessar Coletor de Pix (não seguro)* → *Permitir*. O aviso de "app
+não verificado" é esperado — o app não verificado é o seu próprio script.
 
-O log tem que mostrar as primeiras linhas de um comprovante. Se disser
-`0 conversa(s) encontrada(s)`, é `REMETENTE`/`ASSUNTO` errado ou não chegou
-e-mail novo.
+O log abre com um **VEREDITO** que responde a única pergunta que importa:
+
+```
+marcador 1 "Você recebeu um Pix de": ACHOU
+marcador 2 "Valor Recebido": ACHOU
+pagador: MATHEUS SANTANA CANEJO
+horário do e-mail (chave de dedup): 05 AGO às 18:51
+```
+
+Os **dois marcadores precisam dar ACHOU**, senão o coletor ignora o e-mail. E o
+horário precisa aparecer: é ele que segura a dedup, como explicado na seção 9.
 
 ### 4.4. Enviar um de verdade
 
@@ -154,8 +164,8 @@ Rode **`testarEnvio`**. O log deve mostrar `enviado: {"status":"ok",...}` e o
 Pix tem que aparecer no painel.
 
 Rode **de novo na mesma mensagem**: agora tem que vir `{"status":"duplicado"}` e
-nenhuma linha nova. Se criar linha nova, o UUID não está chegando e o corpo veio
-truncado.
+nenhuma linha nova. Se criar linha nova, o horário do e-mail não está sendo
+lido — volte pro `testarBusca` e olhe aquela linha do veredito.
 
 ### 4.5. Ligar o automático
 
@@ -168,7 +178,7 @@ lugar pra olhar quando algo parar.
 
 ### 4.6. Teste final, com dinheiro de verdade
 
-Manda R$ 0,01 de outra conta pro seu PicPay. Em até um minuto o painel apita.
+Manda R$ 0,01 de outra conta pro seu Nubank. Em até um minuto o painel apita.
 
 Se aparecer "Valor não lido", o texto cru está em `/brutos` — é de lá que sai o
 ajuste do regex, e **no mesmo dia**, porque às 2h ele é apagado.
@@ -210,8 +220,7 @@ Cria um workflow com gatilho **Webhook (POST)**, copia a URL e coloca em
   "pagador": "Mateus Da Silva Assen",
   "recebido_em": "2026-07-27T15:41:02-03:00",
   "hora": "15:41",
-  "canal": "picpay",
-  "transaction_id": "019fd2b5-d600-7163-a294-5879de2a688d"
+  "canal": "nubank"
 }
 ```
 
@@ -340,57 +349,69 @@ limpeza do ciclo 2026-07-28: 37 registros apagados
 ### Lista branca: dois marcadores, senão não é dinheiro
 
 Só vira recebimento se **os dois** existirem no texto: `Você recebeu um Pix de`
-**e** `Valor enviado`. Um marcador só não basta.
+**e** `Valor Recebido`. Um marcador só não basta.
 
-Isso não é frescura: o promocional do próprio PicPay fala em Pix e cita `R$` o
-tempo todo. Com uma lista branca frouxa, um e-mail de marketing viraria dinheiro
-falso no painel. Qualquer coisa que não case com os dois marcadores vai pro
-`/brutos` como `ignorado` e **nunca** conta como recebimento.
+Isso importa mais aqui do que parece: **metade do e-mail do Nubank é
+propaganda.** O bloco "Com o Nubank, você tem mais praticidade na hora de fazer
+um Pix" cita Pix cinco vezes, e nenhuma delas é dinheiro entrando. Com uma lista
+branca frouxa, um e-mail de marketing viraria Pix falso no painel. Qualquer
+coisa que não case com os dois marcadores vai pro `/brutos` como `ignorado` e
+**nunca** conta como recebimento.
 
-### Por que os regex são ancorados no rótulo
+### O e-mail é HTML puro — não existe `text/plain`
 
-O corpo `text/plain` chega assim:
+Isso muda o jogo em relação ao canal anterior. O `Content-Type` do e-mail é
+`text/html` e ponto: quem produz o texto é o Gmail, achatando as tags. Por isso
+a quebra de linha **não é confiável** — ela depende de como cada `<br>` e `</p>`
+foram traduzidos, e isso pode mudar sem aviso.
+
+Todos os regex atravessam quebra de linha de propósito. Nenhum conta linhas ou
+posições: cada um procura o **rótulo** e pega o que vem depois.
+
+Depois de achatado, o miolo fica assim:
 
 ```
-Você recebeu um Pix de
-JOAO DA SILVA SANTOS
-Valor enviado
-R$ 0,35
-Detalhes do pagamento
-Data e hora
-05/08/2026às 13:16
-ID da transação
-019fd2b5-d600-7163-a294-5879de2a688d
+Pix recebido com sucesso.
+Olá, <SEU NOME>.
+Você recebeu um Pix de MATHEUS SANTANA CANEJO e o valor já está disponível
+na sua conta do Nubank.
+Valor Recebido:
+R$ 0,02
+05 AGO às 18:51
 ```
 
-Mas o Gmail reflowa: junta linhas, cola pedaços (`2026às`). Por isso nenhum
-regex conta linhas ou posições — cada um procura o **rótulo** e pega o que vem
-depois, atravessando ou não a quebra de linha. O mesmo e-mail linha a linha ou
-espremido numa linha só dá o mesmo resultado.
+O nome vem no meio da frase, terminado por ` e o valor` — não numa linha
+própria como no PicPay. O valor sai de `Valor Recebido`, nunca do primeiro `R$`
+do texto (que pode ser promoção). Se o rótulo faltar, vira `sem_valor` e cai no
+`/brutos` com o texto inteiro, pro regex se ajustar com o caso real na mão.
 
-O valor sai de `Valor enviado`, nunca do primeiro `R$` do texto: o primeiro
-`R$` solto pode ser tarifa ou promoção. Se o rótulo faltar, vira `sem_valor` e
-cai no `/brutos` com o texto inteiro — aí o regex se ajusta com o caso real na
-mão, em vez de chutar.
+### Dedup: não existe identificador de transação
 
-### Dedup pelo ID da transação
+**O e-mail do Nubank não traz nenhum ID de transação.** Foi procurado no fonte
+cru inteiro: tem valor, nome, data e hora, e nada mais. Não há UUID, número de
+comprovante ou protocolo.
 
-O UUID do `ID da transação` é a chave (`picpay|<uuid>`): ele identifica a
-**transação**, não a hora em que ela chegou aqui. Reenvio do mesmo e-mail duas
-horas depois cai no mesmo hash e não duplica.
+A chave, então, é `valor + nome + horário`. E o horário usado é **o que o
+próprio e-mail declara** (`05 AGO às 18:51`), não o instante em que ele chegou
+no coletor. Essa distinção não é preciosismo:
 
-Vale também no `sem_valor`: se o valor não foi lido mas o UUID veio, o `/brutos`
-não enche de cópias do mesmo e-mail. E-mail sem UUID cai no critério de reserva,
-`valor + nome + minuto`.
+A ponte reenvia o e-mail quando o POST falha, e ela roda de minuto em minuto. Se
+a chave usasse a hora de chegada, a primeira tentativa e a retentativa cairiam
+em minutos diferentes, a chave mudaria junto e **o mesmo Pix entraria duas
+vezes**. Com o horário do e-mail, a chave é a mesma sempre — é isso que torna o
+retry seguro.
 
-Nada disso mexeu no banco — o UUID entra no `dedup_hash` que já existia, e a
-`UNIQUE` da tabela faz o resto. Não há coluna nova nem migração.
+O horário de chegada só entra se o e-mail vier sem horário legível. Aí volta o
+risco de duplicata no reenvio, o que ainda é melhor que não deduplicar nada.
 
-### Quando o PicPay mudar o texto
+O custo dessa escolha está nos *Limites conhecidos*, e é real. Leia.
+
+### Quando o Nubank mudar o texto
 
 1. Copia o texto cru de `/brutos` **no mesmo dia** (às 2h ele some)
-2. Ajusta o regex correspondente no `app.py` — os nomes começam com `PICPAY_`
-3. Deploy, e bumpa o `VERSAO` pra conseguir provar pelo `/saude` que subiu
+2. Ajusta o regex correspondente no `app.py` — os nomes começam com `NUBANK_`
+3. Roda o `testarBusca` no Apps Script: o veredito diz na hora se voltou a casar
+4. Deploy, e bumpa o `VERSAO` pra conseguir provar pelo `/saude` que subiu
 
 O importante: **e-mail não reconhecido nunca vira confirmação de dinheiro.**
 Ele é guardado e fica visível, mas não aparece como Pix confirmado no painel.
@@ -409,7 +430,8 @@ caixa, mas ninguém o lê sozinho depois.
 
 O consolo é que o e-mail **não se perde**: se a ponte ficou dias fora, é só
 tirar a etiqueta `caixa-enviado` das conversas e alargar o `newer_than` da busca
-que o script reenvia tudo. A dedup por UUID segura o que já tinha entrado.
+que o script reenvia tudo. A dedup segura o que já tinha entrado, porque a
+chave usa o horário declarado no e-mail e não muda com o reenvio.
 
 **O relógio mede venda, não ponte.** O ping só acontece quando chega e-mail. Não
 existe batida periódica, então **"Última atualização há 2 horas" pode ser tanto
@@ -431,29 +453,38 @@ que fica verde e vira âmbar depois de `LIMITE_HEARTBEAT_MIN`. Isso evita alarme
 falso — mas significa que uma ponte morta é discreta. Se ninguém olhar a linha,
 ninguém percebe.
 
-**Dois Pix do mesmo valor caem certo.** Vale dizer porque é a dúvida que sempre
-aparece: dois pagamentos são dois `ID da transação` diferentes, e a dedup usa
-**só** o UUID. Valor, nome e horário nem entram na conta. Testado:
+**Dois Pix iguais no mesmo minuto viram uma linha só.** Este é o limite mais
+importante da lista, e ele é consequência direta de o e-mail do Nubank não
+trazer identificador de transação nenhum. Testado:
 
 | Cenário | Resultado |
 |---|---|
-| Clientes diferentes, R$ 100 cada, mesmo minuto | duas linhas |
-| O **mesmo** cliente, R$ 100 duas vezes, mesmo minuto | duas linhas |
-| O mesmo e-mail reenviado | uma linha |
+| Clientes **diferentes**, R$ 100 cada, mesmo minuto | duas linhas |
+| Mesmo cliente, R$ 100, minutos diferentes | duas linhas |
+| O mesmo e-mail reenviado pela ponte | uma linha (correto) |
+| **Mesmo cliente, R$ 100 duas vezes, no mesmo minuto** | **uma linha — o segundo é descartado** |
 
-**Mas se o e-mail chegar sem o `ID da transação`**, a chave cai pro critério de
-reserva `valor + nome + minuto` — e aí dois Pix idênticos no mesmo minuto viram
-uma linha só. O segundo some **sem erro, sem log e sem rastro no painel**.
+O nome do pagador salva a maioria dos casos: dois clientes diferentes pagando o
+mesmo valor no mesmo minuto continuam sendo duas linhas. O que não se separa é o
+**mesmo** pagador repetindo o **mesmo** valor dentro do **mesmo** minuto.
 
-Nunca aconteceu até hoje: o UUID veio em todos os e-mails reais. O risco foi
-avaliado e aceito, mas o modo de falha é dinheiro que entrou e não apareceu na
-tela — se um dia o `/brutos` mostrar comprovante sem o UUID, feche o buraco em
-vez de conviver com ele. A saída pronta é o Apps Script mandar o identificador
-da mensagem do Gmail (`msg.getId()`) como `?msg=<id>` na URL, e o `ingest_pix`
-usar `gmail|<id>` como chave antes de cair no `valor + nome + minuto`: cada
-e-mail tem o seu, ele não muda em reenvio, e são cerca de quatro linhas.
+Quando isso acontece, o Pix descartado deixa um aviso no log do container:
 
-**Conferência diária.** No fechamento, cruza o extrato do PicPay com o que passou
+```
+duplicado descartado | 10000 | ANA SOUZA | 05 AGO às 18:51
+```
+
+Esse log é o único rastro. No painel não aparece nada — nem erro, nem alerta.
+É por isso que a conferência diária importa mais neste canal do que importava
+nos anteriores.
+
+**A saída, se um dia isso doer:** o Apps Script manda o identificador da
+mensagem do Gmail (`msg.getId()`) como `?msg=<id>` na URL, e o `ingest_pix` usa
+`gmail|<id>` como chave antes de cair no `valor + nome + horário`. Como o Nubank
+manda um e-mail por Pix, um e-mail passa a ser um Pix — e o problema desaparece
+por completo. São cerca de quatro linhas no servidor e uma no script.
+
+**Conferência diária.** No fechamento, cruza o extrato do Nubank com o que passou
 pelo painel — é o que pega qualquer Pix que a ponte perdeu. Faça isso **antes
 das 2h**: o painel não mostra mais somatório e o histórico é apagado na
 virada, então o extrato é a única fonte no dia seguinte.
