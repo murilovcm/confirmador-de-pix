@@ -12,10 +12,20 @@
  * Instalação: veja a seção 4 do README.
  */
 
-// Ajuste o remetente conferindo um comprovante de verdade na sua caixa.
-// Filtro errado não dá erro em lugar nenhum — a ponte só fica muda.
+// O filtro é a barreira mais perigosa do sistema inteiro, e já mordeu uma vez:
+// e-mail que não casa aqui NÃO gera etiqueta, NÃO vai pro /brutos e NÃO aparece
+// em lugar nenhum. Some sem rastro. As etiquetas de revisão só protegem o que
+// consegue entrar — filtro estreito é um ponto cego que nem log deixa.
+//
+// Por isso o assunto é curto de propósito. O Nubank usa pelo menos dois
+// assuntos pro mesmo evento ("Você recebeu uma transferência via Pix" e
+// "Você recebeu uma transferência"), e o Gmail casa por frase CONTIDA: o
+// pedaço abaixo pega os dois e aguenta a próxima variante que eles inventarem.
+//
+// O preço é ruído: promocional que comece com "Você recebeu" cai no
+// caixa-revisar. Ruído visível é barato; comprovante invisível, não.
 var REMETENTE = 'todomundo@nubank.com.br';
-var ASSUNTO = 'Você recebeu uma transferência via Pix';
+var ASSUNTO = 'Você recebeu';
 
 // DUAS etiquetas, e a diferença entre elas já custou Pix.
 //
@@ -257,7 +267,11 @@ function testarBusca() {
   Logger.log('assunto: ' + msg.getSubject());
 
   var corpo = texto_(msg);
-  var nome = corpo.match(/voc[eê]\s+recebeu\s+um\s+pix\s+de\s+(.{3,60}?)\s+e\s+o\s+valor\b/i);
+  // Mesma abertura do servidor: cobre "um Pix de" e "uma transferência de".
+  var recebeu = /voc[eê]\s+recebeu\s+(?:um\s+pix|uma\s+transfer[eê]ncia)\s+de/i;
+  var nome = corpo.match(
+    /voc[eê]\s+recebeu\s+(?:um\s+pix|uma\s+transfer[eê]ncia)\s+de\s+(.{3,60}?)\s+e\s+o\s+valor\b/i
+  );
   var quando = corpo.match(
     /valor\s+recebido\s*:?\s*R\$\s*[\d.,]+\s*(\d{1,2}\s+\w{3,}\s+[àa]s\s+\d{1,2}:\d{2})/i
   );
@@ -265,9 +279,9 @@ function testarBusca() {
 
   Logger.log('===== VEREDITO =====');
   Logger.log('tamanho do corpo: ' + corpo.length + ' caracteres');
-  Logger.log('marcador 1 "Você recebeu um Pix de": ' +
-             (/voc[eê]\s+recebeu\s+um\s+pix\s+de/i.test(corpo) ? 'ACHOU' : 'NAO ACHOU'));
-  Logger.log('marcador 2 "Valor Recebido": ' +
+  Logger.log('marcador 1 "recebeu um Pix / uma transferência de": ' +
+             (recebeu.test(corpo) ? 'ACHOU' : 'NAO ACHOU'));
+  Logger.log('marcador 2 "Valor recebido": ' +
              (/valor\s+recebido/i.test(corpo) ? 'ACHOU' : 'NAO ACHOU'));
   Logger.log('pagador: ' + (nome ? nome[1] : 'NAO ACHOU'));
   // O horario do proprio e-mail e a chave de dedup: sem ele, reenvio duplica.

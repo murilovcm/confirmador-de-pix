@@ -1,9 +1,10 @@
 """
 Coletor de Pix — serviço independente.
 
-Recebe o e-mail "Você recebeu uma transferência via Pix" do Nubank (um Apps
-Script lê o Gmail e posta o corpo aqui), parseia, deduplica, grava em SQLite,
-empurra para o n8n e serve o dashboard.
+Recebe os e-mails de dinheiro recebido do Nubank — "Você recebeu uma
+transferência via Pix" e "Você recebeu uma transferência", que são formatos
+diferentes — de um Apps Script que lê o Gmail e posta o corpo aqui. Parseia,
+deduplica, grava em SQLite, empurra para o n8n e serve o dashboard.
 
 Já passaram por aqui dois canais aposentados: notificação do app do Mercado
 Pago via MacroDroid no celular, e o e-mail do PicPay. Os parsers dos dois
@@ -60,7 +61,7 @@ VALIDADE_BRUTOS_MIN = 15
 # Marcador de build — serve pra provar qual versão do código está rodando
 # no container. Bumpar a cada deploy que precise ser verificado.
 # TEMPORÁRIO: remover junto com /saude/headers quando o 401 estiver resolvido.
-VERSAO = "nubank-1"
+VERSAO = "nubank-2"
 
 
 # --------------------------------------------------------------------------
@@ -231,35 +232,47 @@ def limpar_nome(n: str):
 # é confiável: depende de como cada <br> e </p> foram traduzidos. Todos os
 # regex atravessam quebra de linha de propósito.
 #
-# Formato, depois de achatado:
+# O Nubank manda DUAS variantes do mesmo aviso — as duas apareceram no mesmo
+# dia, e a segunda passou despercebida porque o texto muda:
 #
-#   Pix recebido com sucesso.
-#   Olá, <SEU NOME>.
-#   Você recebeu um Pix de <NOME DO PAGADOR> e o valor já está disponível
-#   na sua conta do Nubank.
-#   Valor Recebido:
-#   R$ 0,02
-#   05 AGO às 18:51
+#   Variante "Pix"                        Variante "transferência"
+#   ------------------------------        ------------------------------
+#   Pix recebido com sucesso.             O valor recebido já está
+#   Olá, <SEU NOME>.                      disponível na sua conta.
+#   Você recebeu um Pix de <NOME>         Olá, <SEU NOME>.
+#   e o valor já está disponível          Você recebeu uma transferência
+#   na sua conta do Nubank.               de <NOME> e o valor já tá na
+#   Valor Recebido:                       sua conta do Nubank.
+#   R$ 0,02                               Valor recebido:
+#   05 AGO às 18:51                       R$ 0,17
+#                                         05 AGO às 19:28
 #
-# NÃO EXISTE identificador da transação neste e-mail — nem UUID, nem número de
-# comprovante, nada. Foi procurado no fonte cru inteiro. É por isso que a dedup
-# depende de valor + nome + horário; veja o comentário em ingest_pix.
+# Muda a abertura ("um Pix" / "uma transferência"), muda o título e muda até a
+# caixa alta do rótulo do valor. O que NÃO muda: o nome terminado por "e o
+# valor", o rótulo "valor recebido" antes do R$, e o horário logo depois. Os
+# regex se apoiam só nessas três âncoras.
+#
+# NÃO EXISTE identificador da transação em nenhuma das variantes — nem UUID, nem
+# número de comprovante, nada. Foi procurado no fonte cru inteiro. É por isso
+# que a dedup depende de valor + nome + horário; veja o comentário em
+# ingest_pix.
 # --------------------------------------------------------------------------
 
-NUBANK_ABERTURA = re.compile(r"voc[eê]\s+recebeu\s+um\s+pix\s+de", re.I)
+# A abertura das duas variantes, num lugar só: é a âncora de todos os regex
+# abaixo, e cada cópia solta dela seria um jeito de esquecer uma variante.
+_RECEBEU = r"voc[eê]\s+recebeu\s+(?:um\s+pix|uma\s+transfer[eê]ncia)\s+de"
+
+NUBANK_ABERTURA = re.compile(_RECEBEU, re.I)
 NUBANK_ROTULO_VALOR = re.compile(r"valor\s+recebido", re.I)
 
 NUBANK_NOME_RES = [
     # O nome vem no meio da frase, terminado por " e o valor". Non-greedy pra
     # parar no PRIMEIRO "e o valor" e não engolir a frase inteira.
+    re.compile(_RECEBEU + r"\s+(?P<nome>.{3,60}?)\s+e\s+o\s+valor\b", re.I | re.S),
+    # Reserva, caso o Nubank passe a quebrar linha depois do nome. Sem isso,
+    # uma mudança de layout derrubaria o nome em silêncio.
     re.compile(
-        r"voc[eê]\s+recebeu\s+um\s+pix\s+de\s+(?P<nome>.{3,60}?)\s+e\s+o\s+valor\b",
-        re.I | re.S,
-    ),
-    # Reserva, caso o Nubank passe a quebrar linha depois do nome como o PicPay
-    # fazia. Sem isso, uma mudança de layout derrubaria o nome em silêncio.
-    re.compile(
-        r"voc[eê]\s+recebeu\s+um\s+pix\s+de\s*:?\s*(?P<nome>.{3,60}?)\s*(?=$|valor\s+recebido)",
+        _RECEBEU + r"\s*:?\s*(?P<nome>.{3,60}?)\s*(?=$|valor\s+recebido)",
         re.I | re.M,
     ),
 ]
@@ -280,7 +293,8 @@ NUBANK_QUANDO_RE = re.compile(
 
 def e_nubank(bruto: str) -> bool:
     """Só é comprovante se os DOIS marcadores existirem — o promocional do
-    próprio Nubank fala em Pix o tempo todo e não pode virar dinheiro."""
+    próprio Nubank fala em Pix e transferência o tempo todo, e não pode virar
+    dinheiro."""
     return bool(NUBANK_ABERTURA.search(bruto) and NUBANK_ROTULO_VALOR.search(bruto))
 
 

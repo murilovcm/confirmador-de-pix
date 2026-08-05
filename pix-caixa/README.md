@@ -136,10 +136,19 @@ carregar o token do caixa junto.
 
 ### 4.3. Conferir o filtro
 
-`REMETENTE` e `ASSUNTO` já vêm com os valores reais do Nubank
-(`todomundo@nubank.com.br` / `Você recebeu uma transferência via Pix`),
-conferidos no fonte de um comprovante de verdade. Se um dia a ponte ficar muda,
-é aqui que se olha primeiro — filtro errado não dá erro em lugar nenhum.
+`REMETENTE` e `ASSUNTO` já vêm prontos: `todomundo@nubank.com.br` e o pedaço de
+assunto **`Você recebeu`**.
+
+O assunto é curto de propósito, e isso custou um Pix pra aprender. O Nubank usa
+**pelo menos dois assuntos** pro mesmo evento — `Você recebeu uma transferência
+via Pix` e `Você recebeu uma transferência` — e o filtro original, colado do
+primeiro comprovante, era exato demais pro segundo. Como o Gmail casa por frase
+**contida** no assunto, o pedaço curto pega os dois e aguenta a próxima variante.
+
+> **Este filtro é o ponto cego do sistema.** E-mail que não casa aqui não gera
+> etiqueta, não vai pro `/brutos` e não aparece em lugar nenhum — some sem
+> rastro. As etiquetas de revisão só protegem o que consegue entrar. Se um
+> comprovante sumir sem deixar pista, **desconfie do filtro antes do parser.**
 
 Rode a função **`testarBusca`** (menu de funções → *Executar*). Na primeira
 execução o Google pede autorização: *Revisar permissões* → escolher a conta →
@@ -373,10 +382,29 @@ limpeza do ciclo 2026-07-28: 37 registros apagados
 
 ## 9. Como o parser lê o e-mail
 
+### Duas variantes do mesmo aviso
+
+O Nubank não manda um formato — manda dois, e os dois apareceram no mesmo dia:
+
+| | Variante "Pix" | Variante "transferência" |
+|---|---|---|
+| Assunto | Você recebeu uma transferência **via Pix** | Você recebeu uma transferência |
+| Título | Pix recebido com sucesso. | O valor recebido já está disponível na sua conta. |
+| Frase | Você recebeu **um Pix** de `<NOME>` e o valor já **está** disponível | Você recebeu **uma transferência** de `<NOME>` e o valor já **tá** |
+| Rótulo | Valor **R**ecebido: | Valor **r**ecebido: |
+
+Muda a abertura, muda o título, muda até a caixa alta do rótulo. **O que não
+muda** — e é só nisso que os regex se apoiam:
+
+1. o nome terminado por ` e o valor`
+2. o rótulo `valor recebido` antes do `R$`
+3. o horário logo depois do valor
+
 ### Lista branca: dois marcadores, senão não é dinheiro
 
-Só vira recebimento se **os dois** existirem no texto: `Você recebeu um Pix de`
-**e** `Valor Recebido`. Um marcador só não basta.
+Só vira recebimento se **os dois** existirem no texto: a abertura (`recebeu um
+Pix de` **ou** `recebeu uma transferência de`) **e** `Valor recebido`. Um
+marcador só não basta.
 
 Isso importa mais aqui do que parece: **metade do e-mail do Nubank é
 propaganda.** O bloco "Com o Nubank, você tem mais praticidade na hora de fazer
@@ -395,20 +423,20 @@ foram traduzidos, e isso pode mudar sem aviso.
 Todos os regex atravessam quebra de linha de propósito. Nenhum conta linhas ou
 posições: cada um procura o **rótulo** e pega o que vem depois.
 
-Depois de achatado, o miolo fica assim:
+Depois de achatado, o miolo fica assim (variante "transferência"):
 
 ```
-Pix recebido com sucesso.
+O valor recebido já está disponível na sua conta.
 Olá, <SEU NOME>.
-Você recebeu um Pix de MATHEUS SANTANA CANEJO e o valor já está disponível
+Você recebeu uma transferência de Sabrina Ribeiro Silva e o valor já tá
 na sua conta do Nubank.
-Valor Recebido:
-R$ 0,02
-05 AGO às 18:51
+Valor recebido:
+R$ 0,17
+05 AGO às 19:28
 ```
 
 O nome vem no meio da frase, terminado por ` e o valor` — não numa linha
-própria como no PicPay. O valor sai de `Valor Recebido`, nunca do primeiro `R$`
+própria como no PicPay. O valor sai de `valor recebido`, nunca do primeiro `R$`
 do texto (que pode ser promoção). Se o rótulo faltar, vira `sem_valor` e cai no
 `/brutos` com o texto inteiro, pro regex se ajustar com o caso real na mão.
 
