@@ -1,15 +1,21 @@
 # Coletor de Pix
 
-Serviço independente. Recebe a notificação do app do Mercado Pago (via MacroDroid
-no celular), parseia, deduplica, grava em SQLite, empurra pro n8n e serve o painel.
+Serviço independente. Recebe o e-mail de comprovante do PicPay (o n8n lê o
+Gmail e posta o corpo aqui), parseia, deduplica, grava em SQLite, empurra pro
+n8n e serve o painel.
 
 Não compartilha código nem banco com a royal-loja.
 
 ```
-Celular ──POST──> Coletor ──┬──> Painel (navegador)
-   │                        └──> n8n ──> WhatsApp
-   └──> arquivo local (backup)
+Gmail ──> n8n ──POST──> Coletor ──┬──> Painel (navegador)
+                                  └──> n8n ──> WhatsApp
 ```
+
+> **Houve um segundo canal.** A notificação do app do Mercado Pago chegava pelo
+> MacroDroid no celular. Foi aposentado quando a operação passou a ser só
+> PicPay, e o parser daquele formato saiu junto — código morto que sabe
+> transformar texto em dinheiro é risco, não conveniência. Está no histórico do
+> git se um dia voltar.
 
 ---
 
@@ -59,7 +65,7 @@ falhar, mas significa que esquecer de configurar deixa `/brutos` inacessível.
 
 ---
 
-## 3. Testar antes de mexer no celular
+## 3. Testar antes de ligar o Gmail
 
 ```bash
 # 1. serviço no ar
@@ -68,77 +74,97 @@ curl https://caixa.seudominio.com/saude
 # 2. sem token tem que dar 401
 curl -i -X POST https://caixa.seudominio.com/ingest/pix --data "teste"
 
-# 3. com token, um Pix de mentira
+# 3. com token, um comprovante de mentira
 curl -X POST https://caixa.seudominio.com/ingest/pix \
-  -H "X-Ingest-Token: SEU_TOKEN" \
+  -H "Authorization: Bearer SEU_TOKEN" \
   -H "Content-Type: text/plain" \
-  --data "Você recebeu R$ 12,34 ||| O valor que 50.084.552 Teste Da Silva te transferiu via Pix"
+  --data $'Você recebeu um Pix de\nTESTE DA SILVA\nValor enviado\nR$ 12,34\nID da transação\n019fd2b5-d600-7163-a294-5879de2a688d'
 ```
 
 Esperado no passo 3:
 
 ```json
-{"status":"ok","valor":1234,"pagador":"Teste Da Silva"}
+{"status":"ok","valor":1234,"pagador":"TESTE DA SILVA"}
 ```
+
+Repita o passo 3 **igualzinho**: a segunda vez tem que responder
+`{"status":"duplicado"}`. É a dedup por UUID funcionando.
+
+No passo 1, confira também o campo `versao` — é o que prova qual código está
+rodando no container. Se ele não bateu com o que você acabou de subir, o deploy
+não pegou e o resto do teste está medindo código velho.
 
 Depois abre `https://caixa.seudominio.com`, entra com a `PAINEL_SENHA`, e o
 Pix de teste tem que estar lá.
 
-**Só siga adiante se os três passos funcionarem.** Se algo falhar depois de mexer
-no celular, você vai saber que o problema é no MacroDroid.
+**Só siga adiante se os três passos funcionarem.** Se algo falhar depois de
+ligar o n8n, você vai saber que o problema é no workflow.
 
 ---
 
-## 4. Configurar o celular
+## 4. Ligar o Gmail — workflow de entrada no n8n
 
-### Macro `Pix mercado pago` — trocar a ação
+Workflow novo, separado do que consome o `N8N_WEBHOOK_URL`. Este aqui **entra**
+no caixa; o outro **sai** dele.
 
-Remove *Escrever em arquivo* como ação **principal** e adiciona
-*Conectividade → Requisição HTTP*:
+### Node 1 — `Gmail Trigger`
 
 | Campo | Valor |
 |---|---|
-| Método | POST |
+| Credential | OAuth2 da conta que recebe o comprovante |
+| Poll Times | *Every Minute* |
+| Filters → Search | `from:(no-reply@picpay.com) subject:("Pagamento recebido via Pix")` |
+| Options → Download Attachments | desligado |
+
+**Confira o remetente real** abrindo um comprovante de verdade na sua caixa — o
+`no-reply@picpay.com` acima é chute. Filtro errado não dá erro em lugar nenhum:
+o canal simplesmente fica mudo. Aperte **Fetch Test Event** e olhe o output
+antes de seguir.
+
+### Node 2 — achar o campo com o corpo
+
+No output do trigger, o corpo em texto puro costuma vir em `text` (com
+*Simplify* ligado, que é o padrão). Confirme o nome no seu n8n antes de
+referenciar.
+
+> **Nunca use `snippet`.** Ele é um resumo truncado em ~200 caracteres: o
+> `ID da transação` fica de fora e você perde a dedup por UUID justamente no
+> campo que ela existe pra proteger.
+
+### Node 3 — `HTTP Request`
+
+| Campo | Valor |
+|---|---|
+| Method | POST |
 | URL | `https://caixa.seudominio.com/ingest/pix` |
-| Tipo de conteúdo | **text/plain** |
-| Corpo | `{not_title} ||| {notification}` |
+| Header | `Authorization: Bearer SEU_TOKEN` |
+| Body Content Type | *Raw* → `text/plain` |
+| Body | `{{ $json.text }}` |
 
-Cabeçalho personalizado:
+Use `Authorization: Bearer`, **não** `X-Ingest-Token`: o Traefik do EasyPanel
+remove headers `X-` em requisição externa e você levaria 401 sem entender por
+quê. O token é o mesmo `INGEST_TOKEN` das variáveis de ambiente.
 
-```
-X-Ingest-Token: SEU_TOKEN
-```
+### Testar de ponta a ponta
 
-Use o botão **"..."** para inserir `{not_title}` e `{notification}`.
+Manda um Pix de R$ 0,01 de outra conta pro seu PicPay e espera o e-mail. No
+painel tem que aparecer valor e nome. Se aparecer "Valor não lido", o texto cru
+está em `/brutos` — é de lá que sai o ajuste do regex.
 
-> **Por que text/plain:** um nome como `Ana D'Ávila` ou `Sant'Anna` quebraria um
-> JSON montado à mão pelo MacroDroid. Texto puro não tem escape pra dar errado.
+Rode o workflow **duas vezes no mesmo e-mail** de propósito: a segunda tem que
+responder `{"status":"duplicado"}` e não criar linha nova. Se criar, o UUID não
+está chegando — provavelmente o corpo veio truncado.
 
-### Mantenha o arquivo como backup
+### Este workflow é a única ponte
 
-Depois da ação HTTP, adicione **de novo** a ação *Escrever em arquivo*
-(`Download/pix_captura.txt`, anexar). Se o wi-fi cair ou o VPS estiver
-reiniciando, o MacroDroid tenta o POST uma vez e desiste — o arquivo é onde você
-confere o que se perdeu.
-
-### Gatilho continua sem filtro
-
-Captura tudo do Mercado Pago. O parser tem lista branca: só o que o título
-confirmar vira Pix recebido. Promoção, Pix enviado e fatura vão pra `/brutos`.
-
-### Macro nova: `PING CAIXA`
-
-- **Gatilho:** *Data/Hora → Intervalo regular* → **10 minutos**
-- **Ação:** Requisição HTTP → POST → `https://caixa.seudominio.com/ingest/ping`
-- **Cabeçalho:** `X-Ingest-Token: SEU_TOKEN`
-- **Corpo:** vazio
-
-Sem isso o relógio de "Última atualização" no painel para de andar e você não
-tem como saber se o silêncio é falta de venda ou ponte morta.
+Se ele for desativado, se a credencial do Gmail expirar ou se o n8n cair, **para
+tudo** e nada no painel grita. A única pista é a linha "Última atualização há X"
+envelhecendo. Vale conferir o workflow sempre que o painel passar uma manhã
+inteira quieto.
 
 ---
 
-## 5. Ligar o n8n
+## 5. Ligar o n8n de saída
 
 Cria um workflow com gatilho **Webhook (POST)**, copia a URL e coloca em
 `N8N_WEBHOOK_URL`. O coletor dispara sozinho a cada Pix novo:
@@ -150,12 +176,18 @@ Cria um workflow com gatilho **Webhook (POST)**, copia a URL e coloca em
   "valor_reais": 176.39,
   "pagador": "Mateus Da Silva Assen",
   "recebido_em": "2026-07-27T15:41:02-03:00",
-  "hora": "15:41"
+  "hora": "15:41",
+  "canal": "picpay",
+  "transaction_id": "019fd2b5-d600-7163-a294-5879de2a688d"
 }
 ```
 
+`canal` é constante hoje — existe um canal só. Fica no payload porque é a
+etiqueta de origem: se um dia entrar um segundo banco, quem consome não precisa
+adivinhar de onde veio o dinheiro.
+
 O disparo roda em thread separada com timeout de 8s: n8n fora do ar **não**
-impede o Pix de ser gravado nem atrasa a resposta pro celular.
+impede o Pix de ser gravado nem atrasa a resposta.
 
 ---
 
@@ -164,14 +196,18 @@ impede o Pix de ser gravado nem atrasa a resposta pro celular.
 | Rota | O que é |
 |---|---|
 | `/` | Painel (exige senha) |
-| `/brutos` | Notificações não reconhecidas — exige a senha do painel **e** a `SENHA_BRUTOS` |
+| `/brutos` | E-mails não reconhecidos — exige a senha do painel **e** a `SENHA_BRUTOS` |
 | `/saude` | Healthcheck, sem autenticação |
-| `/ingest/pix` | POST do celular (exige token) |
+| `/ingest/pix` | POST do n8n (exige token) |
 | `/ingest/ping` | Heartbeat (exige token) |
 
 O desbloqueio de `/brutos` vale **15 minutos** e depois pede a senha de novo. É
 de propósito: a sessão do painel dura 30 dias, e uma segunda senha que durasse o
 mesmo não protegeria nada.
+
+`/ingest/ping` continua de pé, mas **ninguém bate nele hoje** — o relógio do
+painel anda pelos Pix que chegam. Ele fica disponível pra quando você quiser um
+agendamento no n8n mantendo o relógio vivo em hora parada (veja *Limites*).
 
 ---
 
@@ -232,24 +268,23 @@ navegador"* — qualquer toque na tela destrava. O painel checa esse estado a ca
 4 segundos, junto com a atualização da lista, então a faixa aparece sozinha sem
 depender de alguém testar.
 
-> O teste de som **não** verifica se o celular está entregando os Pix. Quem faz
-> isso é a linha "Última atualização há X", que anda sozinha a cada 10 minutos.
-> São dois problemas diferentes.
+> O teste de som **não** verifica se os Pix estão chegando. Quem faz isso é a
+> linha "Última atualização há X". São dois problemas diferentes.
 
 ---
 
 ## 8. Limpeza automática às 2h
 
 Todo dia às **2h da manhã** — loja fechada, sem pedido em voo — a tabela `pix` é
-esvaziada por inteiro: recebimentos confirmados **e** notificações não
-reconhecidas. O `texto_bruto` das não reconhecidas carrega nome e valor de
-cliente, então meia limpeza não seria limpeza.
+esvaziada por inteiro: recebimentos confirmados **e** e-mails não reconhecidos.
+O `texto_bruto` dos não reconhecidos carrega nome e valor de cliente, então meia
+limpeza não seria limpeza.
 
 Depois do `DELETE` roda um `VACUUM`: sem ele as páginas liberadas continuariam
 legíveis dentro do arquivo `.db`.
 
 **O que isso te custa:** você perde o material de calibrar regex do dia
-anterior. Se aparecer um formato novo de notificação, copie o texto de `/brutos`
+anterior. Se aparecer um formato novo de e-mail, copie o texto de `/brutos`
 **no mesmo dia** — às 2h ele vai embora.
 
 O `heartbeat` sobrevive à limpeza. Ele é status da ponte, não dado de cliente, e
@@ -267,84 +302,17 @@ limpeza do ciclo 2026-07-28: 37 registros apagados
 
 ---
 
-## 9. Ajustar o parser quando o MP mudar o texto
+## 9. Como o parser lê o e-mail
 
-Toda notificação que o parser não entende fica em `/brutos` com o texto cru.
-Quando aparecer formato novo:
+### Lista branca: dois marcadores, senão não é dinheiro
 
-1. Copia o texto de `/brutos`
-2. Adiciona um regex em `NOME_RES` (ou ajusta `VALOR_RE`) no `app.py`
-3. Deploy
+Só vira recebimento se **os dois** existirem no texto: `Você recebeu um Pix de`
+**e** `Valor enviado`. Um marcador só não basta.
 
-O importante: **notificação não reconhecida nunca vira confirmação de dinheiro.**
-Ela é guardada e fica visível, mas não aparece como Pix confirmado no painel.
-
----
-
-## 10. Segundo canal: PicPay por e-mail
-
-O Mercado Pago entra por notificação do Android. O PicPay entra pelo e-mail
-"Pagamento recebido via Pix", encaminhado para o mesmo `POST /ingest/pix`, com o
-mesmo token. Não há rota nova nem token novo: o `parse()` reconhece o formato
-sozinho e desvia.
-
-### Ligando o Gmail (workflow no n8n)
-
-Workflow novo, separado do que consome o `N8N_WEBHOOK_URL` — este aqui **entra**
-no caixa, o outro **sai** dele.
-
-**1. Node `Gmail Trigger`**
-
-| Campo | Valor |
-|---|---|
-| Credential | OAuth2 da conta que recebe o comprovante |
-| Poll Times | *Every Minute* |
-| Filters → Search | `from:(no-reply@picpay.com) subject:("Pagamento recebido via Pix")` |
-| Options → Download Attachments | desligado |
-
-Confira o remetente real abrindo um comprovante de verdade na sua caixa — o
-`no-reply@picpay.com` acima é chute e o filtro errado significa canal mudo.
-Aperte **Fetch Test Event** e olhe o output antes de seguir.
-
-**2. Achar o campo com o corpo do e-mail**
-
-No output do trigger, o corpo em texto puro costuma vir em `text` (com
-*Simplify* ligado, que é o padrão). Confirme o nome no seu n8n antes de
-referenciar.
-
-> **Nunca use `snippet`.** Ele é um resumo truncado em ~200 caracteres: o
-> `ID da transação` fica de fora e você perde a dedup por UUID justamente no
-> campo que ela existe pra proteger.
-
-**3. Node `HTTP Request`**
-
-| Campo | Valor |
-|---|---|
-| Method | POST |
-| URL | `https://caixa.seudominio.com/ingest/pix` |
-| Header | `Authorization: Bearer SEU_TOKEN` |
-| Body Content Type | *Raw* → `text/plain` |
-| Body | `{{ $json.text }}` |
-
-Use `Authorization: Bearer`, não `X-Ingest-Token`: o Traefik do EasyPanel remove
-headers `X-` em requisição externa e você levaria 401 sem entender por quê. O
-token é o mesmo `INGEST_TOKEN` do celular.
-
-**4. Testar**
-
-Manda um Pix de R$ 0,01 de outra conta pro seu PicPay e espera o e-mail. No
-painel tem que aparecer valor e nome. Se aparecer "Valor não lido", o texto cru
-está em `/brutos` — é de lá que sai o ajuste do regex.
-
-Rode o workflow **duas vezes no mesmo e-mail** de propósito: a segunda tem que
-responder `{"status":"duplicado"}` e não criar linha nova. Se criar, o UUID não
-está chegando — provavelmente o corpo veio truncado.
-
-### Como o canal é reconhecido
-
-Só vira PicPay se **os dois** marcadores existirem no texto: `Você recebeu um
-Pix de` **e** `Valor enviado`. Um marcador só não basta — e-mail de marketing
-fala em Pix o tempo todo.
+Isso não é frescura: o promocional do próprio PicPay fala em Pix e cita `R$` o
+tempo todo. Com uma lista branca frouxa, um e-mail de marketing viraria dinheiro
+falso no painel. Qualquer coisa que não case com os dois marcadores vai pro
+`/brutos` como `ignorado` e **nunca** conta como recebimento.
 
 ### Por que os regex são ancorados no rótulo
 
@@ -374,78 +342,64 @@ mão, em vez de chutar.
 
 ### Dedup pelo ID da transação
 
-O canal Android deduplica por `valor + nome + minuto` — não tem identificador,
-então usa o instante. O PicPay tem: o UUID do `ID da transação` vira a chave
-(`picpay|<uuid>`), o que identifica a **transação**, não a hora em que ela
-chegou aqui. Reenvio do mesmo e-mail duas horas depois cai no mesmo hash e não
-duplica; a janela de um minuto do Android não pegaria isso.
+O UUID do `ID da transação` é a chave (`picpay|<uuid>`): ele identifica a
+**transação**, não a hora em que ela chegou aqui. Reenvio do mesmo e-mail duas
+horas depois cai no mesmo hash e não duplica.
 
-Vale também no `sem_valor`: se o valor não foi lido mas o UUID veio, o
-`/brutos` não enche de cópias do mesmo e-mail. E-mail sem UUID cai no critério
-antigo de valor + nome + minuto.
+Vale também no `sem_valor`: se o valor não foi lido mas o UUID veio, o `/brutos`
+não enche de cópias do mesmo e-mail. E-mail sem UUID cai no critério de reserva,
+`valor + nome + minuto`.
 
 Nada disso mexeu no banco — o UUID entra no `dedup_hash` que já existia, e a
 `UNIQUE` da tabela faz o resto. Não há coluna nova nem migração.
 
-### O PicPay não registra heartbeat — de propósito
+### Quando o PicPay mudar o texto
 
-O relógio "Última atualização há X" mede **a ponte do celular**, e só. Se o
-PicPay pingasse, o painel — que agrega as pontes de forma otimista — mostraria
-"agora mesmo" com o celular morto há horas.
+1. Copia o texto cru de `/brutos` **no mesmo dia** (às 2h ele some)
+2. Ajusta o regex correspondente no `app.py` — os nomes começam com `PICPAY_`
+3. Deploy, e bumpa o `VERSAO` pra conseguir provar pelo `/saude` que subiu
 
-O efeito colateral é conhecido e foi aceito: **com o celular fora do ar e só o
-PicPay entrando, o painel envelhece e vira âmbar mesmo com dinheiro chegando.**
-Isso é ruído, mas é ruído honesto — melhor do que a tela afirmar que está tudo
-em dia quando metade da operação parou.
-
-### No n8n
-
-O webhook dispara igual para os dois canais, com dois campos a mais no payload:
-`canal` (`"mercadopago"` ou `"picpay"`) e `transaction_id` (`null` fora do
-PicPay). Campo novo não quebra fluxo existente; serve pra rotear por canal se
-um dia precisar.
-
-### Duas travas contra o e-mail promocional
-
-A lista branca do canal Android é ampla de propósito — qualquer título com
-"receb" e um `R$` vira recebimento. Isso era seguro enquanto só notificação do
-app do MP chegava ali. Com o e-mail no meio, um promocional do PicPay que diga
-"você recebeu" e cite um `R$` viraria **dinheiro falso no painel**: ele não
-passa no reconhecimento do PicPay (falta `Valor enviado`), mas cairia no parser
-antigo.
-
-**No código:** texto sem o separador `|||` não vem do MacroDroid — que sempre
-manda `{not_title} ||| {notification}` — e não é PicPay reconhecido. Vira
-`ignorado` e vai pro `/brutos`, sem nunca contar como dinheiro. Isso significa
-que **teste manual por `curl` precisa incluir o `|||`**, como o da seção 3.
-
-**No transporte:** ainda assim, mande pro `/ingest/pix` **só** os e-mails que
-casem com remetente e assunto do comprovante — nunca a caixa inteira. A trava
-do código é rede de segurança, não substituto do filtro.
+O importante: **e-mail não reconhecido nunca vira confirmação de dinheiro.**
+Ele é guardado e fica visível, mas não aparece como Pix confirmado no painel.
 
 ---
 
 ## Limites conhecidos
 
 **Não é fonte de verdade.** É tela de conferência. O rodapé instrui a conferir no
-app do MP em caso de dúvida ou valor alto — mantenha esse texto.
+app em caso de dúvida ou valor alto — mantenha esse texto.
 
-**Mercado Pago depende do celular.** Se ele desligar, travar ou perder o wi-fi,
-o canal do MP para — o PicPay, que entra por e-mail, continua. O arquivo local
-guarda o que não foi enviado. E como o PicPay não registra heartbeat, o painel
-continua envelhecendo e avisando que o celular caiu.
+**Canal único, e frágil em pontos que não são seus.** Gmail, credencial OAuth e
+n8n: qualquer um dos três parando derruba a coleta inteira. Não existe backup
+local como havia no celular — o e-mail continua na caixa, mas ninguém o lê
+sozinho depois.
+
+**O relógio mede venda, não ponte.** O ping só acontece quando chega e-mail. Não
+existe batida periódica, então **"Última atualização há 2 horas" pode ser tanto
+ponte morta quanto loja parada** — a tela não sabe diferenciar e não vai fingir
+que sabe.
+
+Consequência prática: `LIMITE_HEARTBEAT_MIN` (60 min) precisa ser maior que a
+maior hora morta normal da loja. Se a linha ficar âmbar todo dia sem motivo, o
+pessoal aprende a ignorá-la e você perde o aviso justamente no dia em que ele
+for verdadeiro. Suba o número antes que isso aconteça.
+
+Se um dia quiser o relógio medindo a ponte de verdade, é um *Schedule Trigger*
+de 10 minutos no n8n batendo em `/ingest/ping` — a rota já existe e já aceita o
+token.
 
 **O painel não grita.** Por decisão de projeto não existe faixa de alarme nem
-aviso de "ponte offline": a única pista de que o celular parou é a linha
-**"Última atualização há X"**, que fica verde e vira âmbar depois de 60 minutos
-(`LIMITE_HEARTBEAT_MIN`). Isso evita alarme falso em hora parada — mas significa
-que uma ponte morta é discreta. Se ninguém olhar a linha, ninguém percebe.
+aviso de "ponte offline": a única pista é a linha **"Última atualização há X"**,
+que fica verde e vira âmbar depois de `LIMITE_HEARTBEAT_MIN`. Isso evita alarme
+falso — mas significa que uma ponte morta é discreta. Se ninguém olhar a linha,
+ninguém percebe.
 
-**Homônimos.** Dois clientes com mesmo nome e mesmo valor no mesmo minuto viram
-uma linha só pela deduplicação. Com valores padronizados (vários pedidos de
-R$ 100) isso é menos raro do que parece.
+**Homônimos.** Só nos e-mails que chegarem sem o `ID da transação`: aí a dedup
+volta a ser valor + nome + minuto, e dois clientes de mesmo nome pagando o mesmo
+valor no mesmo minuto viram uma linha só. Com o UUID presente — o caso normal —
+isso não acontece.
 
-**Conferência diária.** No fechamento, cruza o extrato do MP com o que passou
+**Conferência diária.** No fechamento, cruza o extrato do PicPay com o que passou
 pelo painel — é o que pega qualquer Pix que a ponte perdeu. Faça isso **antes
 das 2h**: o painel não mostra mais somatório e o histórico é apagado na
-virada, então o extrato do Mercado Pago é a única fonte no dia seguinte.
+virada, então o extrato é a única fonte no dia seguinte.

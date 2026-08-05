@@ -1,8 +1,14 @@
 """
 Coletor de Pix — serviço independente.
 
-Recebe a notificação do app do Mercado Pago (via MacroDroid no celular),
-parseia, deduplica, grava em SQLite, empurra para o n8n e serve o dashboard.
+Recebe o e-mail "Pagamento recebido via Pix" do PicPay (o n8n lê o Gmail e
+posta o corpo aqui), parseia, deduplica, grava em SQLite, empurra para o n8n e
+serve o dashboard.
+
+Havia um segundo canal — notificação do app do Mercado Pago via MacroDroid no
+celular — aposentado quando a operação passou a ser só PicPay. O parser daquele
+formato saiu junto: código morto que sabe transformar texto em dinheiro é
+risco, não conveniência. Está no histórico do git se um dia voltar.
 
 Não compartilha código nem banco com a royal-loja.
 """
@@ -38,7 +44,12 @@ SENHA_BRUTOS = os.environ.get("SENHA_BRUTOS", "")
 N8N_WEBHOOK = os.environ.get("N8N_WEBHOOK_URL", "").strip()
 # Depois disso o painel pinta a idade da ultima atualizacao de ambar. Nao gera
 # alarme nem faixa: so tira o verde de quem afirma que esta tudo em dia.
+# Como o ping so acontece quando chega e-mail, este numero mede "tempo sem Pix
+# nenhum", nao "ponte caiu". Menor que a maior hora morta da loja = alarme falso.
 LIMITE_HEARTBEAT_MIN = int(os.environ.get("LIMITE_HEARTBEAT_MIN", "60"))
+
+# Nome da unica ponte que existe hoje: o workflow do n8n que le o Gmail.
+ORIGEM_PONTE = "email"
 
 # Hora em que o histórico é apagado. A loja já fechou, não há pedido em voo.
 HORA_LIMPEZA = int(os.environ.get("HORA_LIMPEZA", "2"))
@@ -49,7 +60,7 @@ VALIDADE_BRUTOS_MIN = 15
 # Marcador de build — serve pra provar qual versão do código está rodando
 # no container. Bumpar a cada deploy que precise ser verificado.
 # TEMPORÁRIO: remover junto com /saude/headers quando o 401 estiver resolvido.
-VERSAO = "picpay-1"
+VERSAO = "so-picpay-1"
 
 
 # --------------------------------------------------------------------------
@@ -109,6 +120,10 @@ def init_db():
         "INSERT OR IGNORE INTO manutencao (chave, ultima_execucao) VALUES (?, ?)",
         ("limpeza_pix", ciclo_atual()),
     )
+    # Sobra da ponte do celular, aposentada. A tabela heartbeat nao e limpa as
+    # 2h, entao essa linha ficaria parada pra sempre no banco fingindo ser uma
+    # ponte que ninguem mais alimenta.
+    con.execute("DELETE FROM heartbeat WHERE origem = 'celular'")
     con.commit()
     con.close()
     log.info("banco pronto em %s", DB_PATH)
@@ -181,28 +196,6 @@ def _loop_limpeza():
         time.sleep(max(60, (alvo - agora).total_seconds()))
 
 
-# --------------------------------------------------------------------------
-# Parser — calibrado no formato real do app do Mercado Pago
-#
-#   TÍTULO ||| CORPO
-#   "Você recebeu R$ 90" ||| "O valor que 50.084.552 Thiago Da Silva Dutra
-#                             te transferiu via Pix já está rendendo..."
-#
-# LISTA BRANCA: só vira recebimento se o TÍTULO confirmar.
-# Notificação desconhecida é guardada, mas nunca conta como dinheiro.
-# --------------------------------------------------------------------------
-
-SEP = "|||"
-TITULO_RECEBIDO = re.compile(r"receb", re.I)
-VALOR_RE = re.compile(r"R\$\s*(?P<valor>\d[\d.]*(?:,\d{1,2})?)")
-
-NOME_RES = [
-    re.compile(r"\bque\s+[\d.\-]{4,}\s+(?P<nome>[^\d|]{3,60}?)\s+te\s+transferiu", re.I),
-    re.compile(r"\bque\s+(?P<nome>[^\d|]{3,60}?)\s+te\s+transferiu", re.I),
-    re.compile(r"(?P<nome>[^\d|]{3,60}?)\s+te\s+(?:transferiu|enviou)", re.I),
-    re.compile(r"\bde\s+(?P<nome>[A-ZÁÂÃÉÊÍÓÔÕÚÇ][^\d|,.;]{2,60})", re.I),
-]
-
 LIXO_NOME = re.compile(r"^(o\s+valor|valor|pix|voc[eê]|sua|seu)\b", re.I)
 
 
@@ -224,7 +217,12 @@ def limpar_nome(n: str):
 
 
 # --------------------------------------------------------------------------
-# Parser do PicPay — segundo canal, via e-mail "Pagamento recebido via Pix".
+# Parser — e-mail do PicPay, "Pagamento recebido via Pix".
+#
+# LISTA BRANCA: só vira dinheiro o texto que casar com os DOIS marcadores do
+# comprovante. Qualquer outra coisa é guardada em /brutos e nunca conta como
+# recebimento — inclusive o promocional do próprio PicPay, que fala em Pix e
+# cita "R$" o tempo todo.
 #
 # Formato da parte text/plain (já decodificada de quoted-printable):
 #
@@ -270,69 +268,34 @@ def e_picpay(bruto: str) -> bool:
     return bool(PICPAY_ABERTURA.search(bruto) and PICPAY_ROTULO_VALOR.search(bruto))
 
 
-def parse_picpay(bruto: str):
-    """Retorna (centavos, pagador, status, transaction_id, canal)."""
+def parse(bruto: str):
+    """Retorna (centavos, pagador, status, transaction_id).
+
+    transaction_id é o UUID do comprovante — falta quando o e-mail chega
+    truncado, e aí a dedup cai no critério de valor + nome + minuto.
+    """
+    if not e_picpay(bruto):
+        return None, None, "ignorado", None
+
     m = PICPAY_UUID_RE.search(bruto)
     transaction_id = m.group("uuid").lower() if m else None
 
     mv = PICPAY_VALOR_RE.search(bruto)
     if not mv:
-        # Sem fallback pro VALOR_RE genérico de propósito: o primeiro "R$" solto
-        # do e-mail pode ser tarifa ou promoção. Vira sem_valor, cai no /brutos
-        # com o texto inteiro e o regex se ajusta com o caso real na mão.
-        return None, None, "sem_valor", transaction_id, "picpay"
+        # Sem fallback pro primeiro "R$" solto do texto, de propósito: ele pode
+        # ser tarifa ou promoção. Vira sem_valor, cai no /brutos com o texto
+        # inteiro e o regex se ajusta com o caso real na mão.
+        return None, None, "sem_valor", transaction_id
 
     mn = PICPAY_NOME_RE.search(bruto)
     # limpar_nome já derruba "Valor enviado" via LIXO_NOME, caso o nome falte.
     nome = limpar_nome(mn.group("nome")) if mn else None
 
-    return para_centavos(mv.group("valor")), nome, "ok", transaction_id, "picpay"
-
-
-def parse(bruto: str):
-    """Retorna (centavos, pagador, status, transaction_id, canal).
-
-    transaction_id só existe no canal PicPay, e nem sempre: e-mail truncado
-    pode chegar sem o UUID. Por isso o canal vem separado, e não deduzido de
-    `transaction_id is not None` — quem decide heartbeat e dedup precisa saber
-    a origem mesmo quando o UUID falta.
-    """
-    if e_picpay(bruto):
-        return parse_picpay(bruto)
-
-    bruto = bruto.replace(">>>", " ").strip()
-    if SEP not in bruto:
-        # Sem separador não veio do MacroDroid, que sempre manda
-        # "{not_title} ||| {notification}". Antes isso virava titulo=corpo=bruto
-        # e caía na lista branca ampla (qualquer "receb" + um "R$"), o que era
-        # seguro enquanto só notificação do app do MP chegava aqui. Com e-mail
-        # no meio, um promocional do PicPay que diga "você recebeu" e cite um
-        # "R$" viraria dinheiro falso no painel. Vai pro /brutos como ignorado.
-        return None, None, "ignorado", None, "mercadopago"
-
-    titulo, corpo = bruto.split(SEP, 1)
-    titulo, corpo = titulo.strip(), corpo.strip()
-
-    if not TITULO_RECEBIDO.search(titulo):
-        return None, None, "ignorado", None, "mercadopago"
-
-    mv = VALOR_RE.search(titulo) or VALOR_RE.search(corpo)
-    if not mv:
-        return None, None, "sem_valor", None, "mercadopago"
-
-    nome = None
-    for regex in NOME_RES:
-        m = regex.search(corpo)
-        if m:
-            nome = limpar_nome(m.group("nome"))
-            if nome:
-                break
-
-    return para_centavos(mv.group("valor")), nome, "ok", None, "mercadopago"
+    return para_centavos(mv.group("valor")), nome, "ok", transaction_id
 
 
 # --------------------------------------------------------------------------
-# n8n — empurra assim que grava, sem bloquear a resposta pro celular
+# n8n — empurra assim que grava, sem bloquear a resposta pro coletor
 # --------------------------------------------------------------------------
 
 def avisar_n8n(payload: dict):
@@ -365,8 +328,8 @@ def token_valido() -> bool:
 def extrair_texto() -> str:
     """Aceita text/plain, form-urlencoded ou JSON.
 
-    O MacroDroid manda text/plain: nome com apóstrofo quebraria
-    um JSON montado à mão pelo app.
+    O n8n manda text/plain: o corpo do e-mail vem com acento, quebra de linha e
+    nome com apóstrofo (`Sant'Anna`), e texto puro não tem escape pra dar errado.
     """
     dados = request.get_json(silent=True)
     if isinstance(dados, dict) and dados.get("texto"):
@@ -376,7 +339,7 @@ def extrair_texto() -> str:
     return request.get_data(as_text=True) or ""
 
 
-def registrar_ping(origem="celular"):
+def registrar_ping(origem=ORIGEM_PONTE):
     db = get_db()
     db.execute(
         """INSERT INTO heartbeat (origem, ultimo_ping) VALUES (?, ?)
@@ -395,14 +358,13 @@ def ingest_pix():
     if not texto:
         return jsonify(erro="texto vazio"), 400
 
-    centavos, pagador, status, transaction_id, canal = parse(texto)
+    centavos, pagador, status, transaction_id = parse(texto)
     agora = datetime.now(TZ)
 
-    # O UUID do PicPay é chave natural: identifica a transação, não o instante
-    # em que ela chegou aqui. Reenvio do mesmo e-mail duas horas depois cai no
-    # mesmo hash, coisa que a janela de um minuto do canal Android não pegaria.
-    # Vale inclusive no sem_valor: se o valor não foi lido mas o UUID veio, o
-    # /brutos não enche de cópias do mesmo e-mail.
+    # O UUID do comprovante é chave natural: identifica a transação, não o
+    # instante em que ela chegou aqui. Reenvio do mesmo e-mail duas horas depois
+    # cai no mesmo hash. Vale inclusive no sem_valor: se o valor não foi lido
+    # mas o UUID veio, o /brutos não enche de cópias do mesmo e-mail.
     if transaction_id:
         chave = f"picpay|{transaction_id}"
     elif status == "ok":
@@ -422,17 +384,18 @@ def ingest_pix():
         db.commit()
         novo_id = cur.lastrowid
     except sqlite3.IntegrityError:
-        if canal != "picpay":
-            registrar_ping()
+        # Duplicado também prova que a ponte está viva — e-mail repetido é o n8n
+        # funcionando, não parado.
+        registrar_ping()
         return jsonify(status="duplicado"), 200
 
-    # O heartbeat mede a ponte do celular e mais nada. Se o PicPay pingasse, o
-    # painel — que agrega as pontes de forma otimista — mostraria "atualizado
-    # agora" com o celular morto há horas. Prefere-se o painel envelhecer à
-    # vista de todos a ele afirmar que está tudo em dia.
-    if canal != "picpay":
-        registrar_ping()
-    log.info("pix %s | %s | %s | %s", canal, status, centavos, pagador)
+    # O relógio do painel anda a cada e-mail que chega, e só. Não existe ping
+    # periódico: sem venda o relógio envelhece e a linha vira âmbar mesmo sem
+    # nada quebrado. É o desenho escolhido — LIMITE_HEARTBEAT_MIN é o que separa
+    # "hora parada" de "ponte morta", e precisa ser maior que a maior hora morta
+    # normal da loja, senão vira alarme falso diário.
+    registrar_ping()
+    log.info("pix %s | %s | %s", status, centavos, pagador)
 
     if status == "ok":
         avisar_n8n({
@@ -442,11 +405,11 @@ def ingest_pix():
             "pagador": pagador,
             "recebido_em": agora.isoformat(),
             "hora": agora.strftime("%H:%M"),
-            "canal": canal,
+            "canal": "picpay",
             "transaction_id": transaction_id,
         })
 
-    return jsonify(status=status, valor=centavos, pagador=pagador, canal=canal), 200
+    return jsonify(status=status, valor=centavos, pagador=pagador), 200
 
 
 @app.post("/ingest/ping")
@@ -522,7 +485,7 @@ def api_pix():
             "online": minutos < LIMITE_HEARTBEAT_MIN,
         })
     if not pontes:
-        pontes = [{"origem": "celular", "minutos": 999, "online": False}]
+        pontes = [{"origem": ORIGEM_PONTE, "minutos": 999, "online": False}]
 
     pix = [{
         "id": l["id"],
