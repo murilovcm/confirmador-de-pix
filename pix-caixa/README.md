@@ -348,7 +348,7 @@ o alerta quebrou.
 ### O pulso: insiste até alguém conferir
 
 Um bip único, no instante da chegada, se perde se ninguém estava no balcão. Por
-isso o alerta **repete a cada 3 segundos enquanto houver Pix não conferido**, e
+isso o alerta **repete a cada 1 segundo enquanto houver Pix não conferido**, e
 para no clique em *Conferir*.
 
 Vale para **qualquer** pendente, inclusive os que já estavam na tela quando a
@@ -358,16 +358,23 @@ ninguém viu chegar.
 
 Cada Pix novo reabre a janela inteira de insistência.
 
-**O pulso desiste depois de 15 minutos** (≈ 300 bips) e o Pix continua na lista,
+**O pulso desiste depois de 15 minutos** (≈ 900 bips) e o Pix continua na lista,
 sem tarja de conferido, esperando o clique. O motivo é de operação, não técnico:
 se 15 minutos de insistência não chamaram ninguém, não tem ninguém lá, e
 continuar apitando a noite toda só ensina o funcionário a desligar o som de vez
 — e aí você perde os Pix de verdade.
 
-Os dois números vivem no topo do `<script>` do `painel.html`:
+O limite continua sendo **tempo**, e não contagem de bips, mesmo com o intervalo
+de 1 s. A pergunta que ele responde é "tem alguém no balcão?", e a resposta não
+muda com a densidade do alerta. O que mudou foi o volume de insistência dentro
+da janela: 900 bips no pior caso, contra 300 do intervalo antigo. Se o pessoal
+começar a desligar o som, é este número que está alto — mexa nele antes de
+encurtar a janela.
+
+Os dois números vivem no topo do `<script>` do `painel.html`, junto do `bip()`:
 
 ```js
-const INTERVALO_PULSO = 3000;         // 3s entre bips
+const INTERVALO_PULSO = 1000;         // 1s entre bips
 const LIMITE_PULSO = 15 * 60 * 1000;  // 15 min de insistência
 ```
 

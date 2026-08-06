@@ -303,6 +303,49 @@ function bip(){
   });
 }
 
+// --- O pulso: insiste ate alguem conferir ---------------------------------
+//
+// Um bip unico, no instante da chegada, se perde se ninguem estava no balcao —
+// e ai o Pix fica na lista sem ninguem saber que chegou. Por isso o alerta
+// REPETE enquanto houver Pix nao conferido, e para no clique em Conferir.
+//
+// Vale pra QUALQUER pendente, inclusive os que ja estavam na tela quando a
+// pagina carregou. E de proposito: se o tablet reinicia sozinho com Pix
+// pendente, esses sao justamente os que correm mais risco de serem esquecidos,
+// porque ninguem viu chegar.
+//
+// 1s entre bips, e nao 3s: o balcao com movimento engole bip espacado, e a
+// janela de 15 min ja limita o estrago. Sao ~900 bips no pior caso.
+const INTERVALO_PULSO = 1000;
+const LIMITE_PULSO = 15 * 60 * 1000;
+
+// `pulsoAte` guarda o fim da janela E serve de memoria de que ela ja foi
+// aberta. Sem essa segunda funcao, o render (que roda de 4 em 4s) reabriria a
+// janela logo depois dela expirar, e a insistencia nunca terminaria.
+// Zero = nenhuma janela aberta pro lote de pendentes atual.
+let pulso = null, pulsoAte = 0;
+
+function abrePulso(){
+  // Cada Pix novo reabre a janela INTEIRA, em vez de aproveitar o que sobrou
+  // da anterior: o alerta e sobre o dinheiro que acabou de entrar.
+  pulsoAte = Date.now() + LIMITE_PULSO;
+  if (!pulso) pulso = setInterval(pulsar, INTERVALO_PULSO);
+}
+
+function paraPulso(){
+  clearInterval(pulso);
+  pulso = null;
+}
+
+function pulsar(){
+  // Expirou: para de tocar, mas NAO zera o pulsoAte. E ele que impede o render
+  // de reabrir a janela enquanto o mesmo Pix continuar pendente.
+  if (Date.now() > pulsoAte) return paraPulso();
+  // somOn e conferido a cada batida, e nao so na abertura: desligar o 🔔 no
+  // meio da insistencia tem que calar na hora.
+  if (somOn) bip();
+}
+
 async function conferir(id, botao){
   botao.disabled = true;
   try { await fetch('/api/conferir/'+id, {method:'POST'}); await carregar(); }
@@ -363,7 +406,19 @@ function render(d){
     ul.appendChild(li);
   }
 
+  // O bip da CHEGADA e imediato; o pulso so bate um segundo depois.
   if (novos > 0 && somOn) bip();
+
+  // O pulso segue os PENDENTES, e nao os novos: e a pendencia que precisa de
+  // gente, nao a novidade. Zerou (alguem conferiu), cala na hora.
+  if (d.pendentes === 0){
+    paraPulso();
+    pulsoAte = 0;             // libera a proxima janela
+  } else if (novos > 0 || pulsoAte === 0){
+    // pulsoAte === 0 cobre o caso do reload com Pix ja pendente na tela.
+    abrePulso();
+  }
+
   // roda a cada 4s junto com o polling: se o navegador suspender o audio com a
   // aba em segundo plano, a faixa aparece sozinha, sem esperar um teste manual
   revisaBloqueio();
