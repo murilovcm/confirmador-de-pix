@@ -22,11 +22,16 @@ Gmail ──> Apps Script ──POST──> Coletor ──┬──> Painel (nav
 ## 1. Gerar os segredos
 
 ```bash
-python -c "import secrets; [print(secrets.token_urlsafe(32)) for _ in range(2)]"
+python -c "import secrets; [print(secrets.token_urlsafe(32)) for _ in range(3)]"
 ```
 
-Primeiro valor → `SECRET_KEY`. Segundo → `INGEST_TOKEN`.
+Primeiro valor → `SECRET_KEY`. Segundo → `INGEST_TOKEN` (Vapor Store). Terceiro →
+`INGEST_TOKEN_ROYAL` (Royal / Pods Ilha).
 A `PAINEL_SENHA` você escolhe (vai ser digitada por gente).
+
+**Os dois tokens de ingestão têm que ser diferentes**, e não por higiene: é por
+eles que o servidor sabe de qual loja veio cada Pix. Token repetido faz as duas
+lojas virarem uma só.
 
 ---
 
@@ -51,7 +56,8 @@ e você só descobre quando precisar conferir o fechamento de ontem.
 
 ```
 SECRET_KEY=<primeiro token gerado>
-INGEST_TOKEN=<segundo token gerado>
+INGEST_TOKEN=<segundo token gerado — Vapor Store>
+INGEST_TOKEN_ROYAL=<terceiro token gerado — Royal / Pods Ilha>
 PAINEL_SENHA=<senha do painel>
 SENHA_BRUTOS=<segunda senha, só pra aba de não reconhecidas>
 N8N_WEBHOOK_URL=<opcional, só pra repassar o Pix adiante — pode deixar vazio>
@@ -59,6 +65,10 @@ DB_PATH=/data/pix.db
 LIMITE_HEARTBEAT_MIN=60
 HORA_LIMPEZA=2
 ```
+
+**Um token por loja, e não por acaso: o token é o que diz de qual loja veio o
+Pix.** Veja *Duas lojas, um painel* na seção 4.7. Se você tem uma loja só, deixe
+o `INGEST_TOKEN_ROYAL` vazio — aquela origem simplesmente não autentica.
 
 `SENHA_BRUTOS` vazia **tranca a aba pra todo mundo** — é o lado seguro pra
 falhar, mas significa que esquecer de configurar deixa `/brutos` inacessível.
@@ -96,9 +106,9 @@ No passo 1, confira também o campo `versao` — é o que prova qual código est
 rodando no container. Se ele não bateu com o que você acabou de subir, o deploy
 não pegou e o resto do teste está medindo código velho.
 
-O campo `ponte` do mesmo `/saude` faz o mesmo pela ponte do Gmail, e vem `null`
-até ela mandar o primeiro e-mail. Veja *As duas versões* na seção 9 — essa
-distinção já custou um Pix.
+O objeto `pontes` do mesmo `/saude` faz o mesmo por cada ponte do Gmail, uma
+entrada por loja, e vem `null` até aquela ponte mandar o primeiro e-mail. Veja
+*As duas versões* na seção 9 — essa distinção já custou um Pix.
 
 Depois abre `https://caixa.seudominio.com`, entra com a `PAINEL_SENHA`, e o
 Pix de teste tem que estar lá.
@@ -212,6 +222,68 @@ Manda R$ 0,01 de outra conta pro seu Nubank. Em até um minuto o painel apita.
 Se aparecer "Valor não lido", o texto cru está em `/brutos` — é de lá que sai o
 ajuste do regex, e **no mesmo dia**, porque às 2h ele é apagado.
 
+### 4.7. Duas lojas, um painel
+
+São dois sócios, duas contas Google e duas contas Nubank, mas **um painel só**:
+os Pix das duas caem na mesma lista, ordenados por horário, cada linha com o
+nome da loja escrito.
+
+| Código interno | Quem recebe | Aparece no painel como | Token |
+|---|---|---|---|
+| `murilo-vaporstore` | Gmail do Murilo | **Vapor Store** | `INGEST_TOKEN` |
+| `matheus-royal-podsilha` | Gmail do Matheus | **Royal / Pods Ilha** | `INGEST_TOKEN_ROYAL` |
+
+#### O token é a loja
+
+Não existe, em lugar nenhum da requisição, um campo dizendo de qual loja é o
+Pix. Quem responde isso é **o token que autenticou**. A diferença não é
+elegância, é modo de falha:
+
+| | Ponte mal configurada resulta em |
+|---|---|
+| Se a loja fosse declarada (`?loja=royal`) | Pix entra na **loja errada**, e passa despercebido porque a linha *parece* certa |
+| Como está (token = loja) | **401**. Não entra nada, o e-mail fica sem etiqueta e volta na rodada seguinte |
+
+Dois efeitos colaterais bons: cada sócio guarda só o próprio token, e o
+`gmail-apps-script.gs` fica **idêntico** nas duas contas — muda só a propriedade
+`INGEST_TOKEN` do projeto. Num sistema onde ponte copiada e colada já ficou meses
+atrás do repositório, ter um arquivo só pra manter vale bastante.
+
+#### Instalar a segunda ponte
+
+Na conta Google do **Matheus**, repita a seção 4 inteira, com uma diferença só:
+
+| Propriedade do script | Valor |
+|---|---|
+| `CAIXA_URL` | **o mesmo** de sempre |
+| `INGEST_TOKEN` | o `INGEST_TOKEN_ROYAL` do EasyPanel |
+
+O arquivo colado é o mesmo. As etiquetas `caixa-enviado`, `caixa-revisar` e
+`caixa-ruido` nascem sozinhas na caixa dele.
+
+Depois de rodar o `testarEnvio` lá, o `/saude` prova que chegou:
+
+```json
+{ "versao": "duas-origens-1",
+  "pontes": { "murilo-vaporstore": "ponte-3", "matheus-royal-podsilha": "ponte-3" } }
+```
+
+`null` numa ponte quer dizer "nunca mandou nada" — ou não foi instalada, ou o
+token dela está errado e está tomando 401 calado. **A ponte da Vapor não precisa
+ser tocada:** ela usa o `INGEST_TOKEN` de sempre.
+
+#### O som toca pelas duas
+
+Decisão de operação, tomada de propósito: **qualquer tablet apita por Pix de
+qualquer loja**, e qualquer funcionário confere Pix de qualquer loja. O custo é
+que no balcão da Vapor o número de bips dobra e metade não é de lá.
+
+O que segura isso de pé é a conferência cruzada. O pulso de 1 s só para quando
+alguém clica em *Conferir* — então quem ouve precisa poder agir, senão o painel
+apitaria 15 minutos por um Pix que não é dele. **Se um dia o som passar a tocar
+só pela própria loja, a conferência cruzada tem que sair junto**, ou o balcão
+fica com um alarme que ele não consegue desligar.
+
 ### As três etiquetas
 
 A ponte marca no Gmail o que já processou, e a etiqueta diz **o que o coletor
@@ -257,11 +329,16 @@ conserto não tinha pegado.
 > Sempre que ajustar o parser, olhe o `label:caixa-revisar` antes das 2h. É a
 > fila de e-mails que entraram como `ignorado` e ainda podem virar Pix.
 
-### Esta é a única ponte
+### Cada loja tem uma ponte só
 
 Se o gatilho for removido, se a autorização do script for revogada ou se o
-Google suspender o projeto por cota, **para tudo** — e nada no painel grita. A
-única pista é a linha "Última atualização há X" envelhecendo.
+Google suspender o projeto por cota, **aquela loja para** — e nada no painel
+grita. A única pista é a linha "Última atualização há X" envelhecendo, que agora
+nomeia a ponte atrasada.
+
+As duas contas são independentes: a da Vapor pode estar coletando normalmente
+enquanto a do Matheus está parada há horas. É exatamente por isso que a linha de
+status mostra a ponte **mais atrasada** e não a mais recente.
 
 Duas coisas que valem a pena saber antes de acontecerem:
 
@@ -294,13 +371,16 @@ Cria um workflow com gatilho **Webhook (POST)**, copia a URL e coloca em
   "pagador": "Mateus Da Silva Assen",
   "recebido_em": "2026-07-27T15:41:02-03:00",
   "hora": "15:41",
-  "canal": "nubank"
+  "canal": "nubank",
+  "origem": "murilo-vaporstore",
+  "origem_nome": "Vapor Store"
 }
 ```
 
-`canal` é constante hoje — existe um canal só. Fica no payload porque é a
-etiqueta de origem: se um dia entrar um segundo banco, quem consome não precisa
-adivinhar de onde veio o dinheiro.
+`origem` é a **loja**; `canal` é o **banco**. Hoje o canal é constante porque só
+existe o Nubank — os dois campos são separados justamente pra que, no dia em que
+entrar um segundo banco, eles possam variar de forma independente sem quebrar
+quem consome.
 
 O disparo roda em thread separada com timeout de 8s: n8n fora do ar **não**
 impede o Pix de ser gravado nem atrasa a resposta.
@@ -535,7 +615,7 @@ do texto (que pode ser promoção). Se o rótulo faltar, vira `sem_valor` e cai 
 cru inteiro: tem valor, nome, data e hora, e nada mais. Não há UUID, número de
 comprovante ou protocolo.
 
-A chave, então, é `valor + nome + horário`. E o horário usado é **o que o
+A chave, então, é `loja + valor + nome + horário`. E o horário usado é **o que o
 próprio e-mail declara** (`05 AGO às 18:51`), não o instante em que ele chegou
 no coletor. Essa distinção não é preciosismo:
 
@@ -547,6 +627,13 @@ retry seguro.
 
 O horário de chegada só entra se o e-mail vier sem horário legível. Aí volta o
 risco de duplicata no reenvio, o que ainda é melhor que não deduplicar nada.
+
+**A loja entra na chave, e isso importa mais do que parece.** São duas contas
+Nubank independentes, cada uma com a sua clientela: R$ 100 do "João" às 14h32 na
+Vapor e R$ 100 do "João" às 14h32 na Royal são **dois Pix de verdade**. Sem a
+loja na chave o segundo seria descartado em silêncio — sumiria do painel
+deixando só uma linha de log. É o pior modo de falha deste sistema, e com duas
+lojas ele deixaria de ser raro.
 
 O custo dessa escolha está nos *Limites conhecidos*, e é real. Leia.
 
@@ -574,26 +661,30 @@ Se você mexeu no `.gs` em vez do `app.py`, o passo 4 é outro: colar o arquivo 
 
 ### As duas versões, e por que elas existem
 
-`/saude` devolve dois campos, e eles são de **códigos diferentes**:
+`/saude` devolve campos de **códigos diferentes**:
 
 ```json
-{ "versao": "nubank-3", "ponte": "ponte-3" }
+{ "versao": "duas-origens-1",
+  "pontes": { "murilo-vaporstore": "ponte-3", "matheus-royal-podsilha": "ponte-3" } }
 ```
 
-`versao` é o servidor, que sobe por deploy. `ponte` é o `VERSAO_PONTE` que o
-Apps Script declarou da última vez que mandou um e-mail — e esse **não sobe por
-deploy nenhum**: o `gmail-apps-script.gs` é copiado e colado à mão dentro do
-`script.google.com`, e o Google não tem ideia de que este repositório existe.
+`versao` é o servidor, que sobe por deploy. Cada entrada de `pontes` é o
+`VERSAO_PONTE` que aquele Apps Script declarou da última vez que mandou um
+e-mail — e esse **não sobe por deploy nenhum**: o `gmail-apps-script.gs` é
+copiado e colado à mão dentro do `script.google.com`, e o Google não tem ideia de
+que este repositório existe. Com duas contas, agora **cada uma pode ficar pra
+trás sozinha**.
 
 Foi exatamente aí que o Pix de R$ 176 se perdeu. O filtro de assunto tinha sido
 corrigido no repositório (commit `a7ea593`), a correção estava certa, e a ponte
 no Google continuou meses rodando a versão antiga. **O conserto existia e não
 estava rodando**, e nada no sistema reclamava.
 
-Por isso: **toda vez que colar o `.gs` no Apps Script, bumpe o `VERSAO_PONTE`**,
-e confira no `/saude` que o campo `ponte` mudou. Se ele não bater com o valor do
-arquivo, o que está rodando lá é código velho — e é o primeiro lugar pra olhar
-quando um comprovante sumir.
+Por isso: **toda vez que colar o `.gs` num dos Apps Script, bumpe o
+`VERSAO_PONTE`** — e cole nos **dois**, senão as contas ficam em versões
+diferentes. Confira no `/saude` que as duas entradas de `pontes` mudaram. A que
+não bater com o arquivo está rodando código velho, e é o primeiro lugar pra
+olhar quando um comprovante daquela loja sumir.
 
 O importante: **e-mail não reconhecido nunca vira confirmação de dinheiro.**
 Ele é guardado e fica visível, mas não aparece como Pix confirmado no painel.
@@ -605,15 +696,16 @@ Ele é guardado e fica visível, mas não aparece como Pix confirmado no painel.
 **Não é fonte de verdade.** É tela de conferência. O rodapé instrui a conferir no
 app em caso de dúvida ou valor alto — mantenha esse texto.
 
-**A ponte não tem deploy — ela tem copiar e colar.** É o ponto mais frágil do
-sistema hoje, e o que já custou um Pix: o `.gs` corrigido no repositório não
-chega no Google sozinho, e ninguém percebe a diferença. O campo `ponte` do
-`/saude` existe pra tornar isso visível, mas ele só **denuncia** a deriva —
-não impede. Confira depois de toda alteração no `.gs`.
+**A ponte não tem deploy — ela tem copiar e colar, agora em duas contas.** É o
+ponto mais frágil do sistema, e o que já custou um Pix: o `.gs` corrigido no
+repositório não chega no Google sozinho, e ninguém percebe a diferença. Com duas
+contas o risco dobra, porque dá pra colar numa e esquecer da outra. O objeto
+`pontes` do `/saude` existe pra tornar isso visível, mas ele só **denuncia** a
+deriva — não impede. Confira as duas depois de toda alteração no `.gs`.
 
-**Canal único, e frágil em pontos que não são seus.** Gmail, autorização do
-script e cota do Apps Script: qualquer um dos três parando derruba a coleta
-inteira. Não existe backup local como havia no celular — o e-mail continua na
+**Uma ponte por loja, e frágil em pontos que não são seus.** Gmail, autorização
+do script e cota do Apps Script: qualquer um dos três parando derruba a coleta
+**daquela loja**. Não existe backup local como havia no celular — o e-mail continua na
 caixa, mas ninguém o lê sozinho depois.
 
 O consolo é que o e-mail **não se perde**: se a ponte ficou dias fora, é só
@@ -626,6 +718,12 @@ reenvio.
 existe batida periódica, então **"Última atualização há 2 horas" pode ser tanto
 ponte morta quanto loja parada** — a tela não sabe diferenciar e não vai fingir
 que sabe.
+
+Com duas lojas, a linha passa a mostrar a **ponte mais atrasada**, e a nomear
+qual é: *"Royal / Pods Ilha sem atualização há 2 horas"*. Antes ela mostrava a
+mais recente, o que com duas pontes era um bug de esconder problema — a loja que
+parou de mandar ficava atrás da que continua vendendo, e a linha seguia verde
+afirmando que estava tudo em dia.
 
 Consequência prática: `LIMITE_HEARTBEAT_MIN` (60 min) precisa ser maior que a
 maior hora morta normal da loja. Se a linha ficar âmbar todo dia sem motivo, o
@@ -650,17 +748,20 @@ trazer identificador de transação nenhum. Testado:
 |---|---|
 | Clientes **diferentes**, R$ 100 cada, mesmo minuto | duas linhas |
 | Mesmo cliente, R$ 100, minutos diferentes | duas linhas |
+| **Lojas diferentes**, mesmo cliente, R$ 100, mesmo minuto | duas linhas |
 | O mesmo e-mail reenviado pela ponte | uma linha (correto) |
-| **Mesmo cliente, R$ 100 duas vezes, no mesmo minuto** | **uma linha — o segundo é descartado** |
+| **Mesma loja, mesmo cliente, R$ 100 duas vezes, no mesmo minuto** | **uma linha — o segundo é descartado** |
 
-O nome do pagador salva a maioria dos casos: dois clientes diferentes pagando o
-mesmo valor no mesmo minuto continuam sendo duas linhas. O que não se separa é o
-**mesmo** pagador repetindo o **mesmo** valor dentro do **mesmo** minuto.
+O nome do pagador salva a maioria dos casos, e a loja salva o resto: dois
+clientes diferentes pagando o mesmo valor no mesmo minuto continuam sendo duas
+linhas, e o mesmo nome em lojas diferentes também. O que não se separa é o
+**mesmo** pagador repetindo o **mesmo** valor dentro do **mesmo** minuto **na
+mesma loja**.
 
 Quando isso acontece, o Pix descartado deixa um aviso no log do container:
 
 ```
-duplicado descartado | 10000 | ANA SOUZA | 05 AGO às 18:51
+duplicado descartado | murilo-vaporstore | 10000 | ANA SOUZA | 05 AGO às 18:51
 ```
 
 Esse log é o único rastro. No painel não aparece nada — nem erro, nem alerta.
@@ -673,7 +774,16 @@ mensagem do Gmail (`msg.getId()`) como `?msg=<id>` na URL, e o `ingest_pix` usa
 manda um e-mail por Pix, um e-mail passa a ser um Pix — e o problema desaparece
 por completo. São cerca de quatro linhas no servidor e uma no script.
 
-**Conferência diária.** No fechamento, cruza o extrato do Nubank com o que passou
-pelo painel — é o que pega qualquer Pix que a ponte perdeu. Faça isso **antes
-das 2h**: o painel não mostra mais somatório e o histórico é apagado na
-virada, então o extrato é a única fonte no dia seguinte.
+**O som não distingue loja, e isso foi escolhido.** Todo tablet apita por Pix de
+qualquer loja, e qualquer funcionário confere Pix de qualquer loja. No balcão da
+Vapor isso dobra o número de bips e metade não é de lá — o risco conhecido é
+alguém desligar o som, que é justamente como se perde um Pix de verdade. As duas
+metades andam juntas: **se um dia o som passar a tocar só pela própria loja, a
+conferência cruzada tem que sair junto**, senão o balcão fica com um alarme de
+15 minutos que ele não consegue desligar.
+
+**Conferência diária, agora com dois extratos.** No fechamento, cruza o extrato
+de **cada** conta Nubank com o que passou pelo painel — é o que pega qualquer
+Pix que uma das pontes perdeu. Faça isso **antes das 2h**: o painel não mostra
+somatório e o histórico das duas lojas é apagado junto na virada, então os
+extratos são a única fonte no dia seguinte.

@@ -41,6 +41,19 @@
   .valor{font-size:26px;font-weight:800;letter-spacing:-.6px;line-height:1.15}
   li.feito .valor{text-decoration:line-through}
   .nome{color:var(--txt2);font-size:14px;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+  /* Carimbo da loja. Duas contas Nubank caem na mesma lista, e sem isto nao ha
+     como saber de qual delas e o dinheiro.
+     A cor NUNCA carrega o significado sozinha — o nome esta sempre escrito.
+     Tablet de balcao pega reflexo, e nem todo mundo separa azul de violeta.
+     As cores sao frias de proposito: lime e "Pix novo", verde e ponte viva,
+     ambar e ponte velha, vermelho e alerta. Nenhuma delas podia ser reusada. */
+  .loja{
+    display:inline-block;margin-top:6px;padding:3px 9px;border-radius:6px;
+    font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;
+  }
+  .loja.murilo-vaporstore{background:rgba(56,160,255,.16);color:#7FC4FF}
+  .loja.matheus-royal-podsilha{background:rgba(167,120,255,.16);color:#C3A6FF}
   .hora{color:var(--txt2);font-size:12px;margin-top:6px;font-variant-numeric:tabular-nums}
   .btn{flex:none;background:var(--accent);color:var(--accent-esc);border:none;border-radius:9999px;padding:0 22px;height:48px;min-width:104px;font-size:15px;font-weight:700;cursor:pointer}
   .btn:active{transform:scale(.97)}
@@ -368,10 +381,21 @@ function render(d){
   // A linha conta o tempo desde o primeiro minuto e so muda de cor ao passar
   // do limite. Sem faixa e sem afirmar que a ponte quebrou: o painel informa
   // a idade do dado e deixa a conclusao pra quem esta na loja.
-  const online = d.pontes.some(p => p.online);
-  const minutos = Math.min(...d.pontes.map(p => p.minutos));
+  //
+  // Manda a ponte MAIS VELHA, e nao a mais fresca. Com uma ponte so dava no
+  // mesmo; com duas, `Math.min` era um bug de esconder problema: a loja que
+  // parou de mandar ficava atras da que continua vendendo, e a linha seguia
+  // verde afirmando que estava tudo em dia.
+  //
+  // E quando ela esta atrasada, a linha DIZ O NOME dela. "Ultima atualizacao ha
+  // 2 horas" com duas lojas nao da o que fazer; "Royal / Pods Ilha sem
+  // atualizacao ha 2 horas" da.
+  const pior = d.pontes.reduce((a, b) => (b.minutos > a.minutos ? b : a));
+  const online = pior.online;
   const st = document.getElementById('statusTxt');
-  st.textContent = 'Última atualização ' + faz(minutos);
+  st.textContent = online || d.pontes.length < 2
+    ? 'Última atualização ' + faz(pior.minutos)
+    : pior.nome + ' sem atualização ' + faz(pior.minutos);
   st.classList.remove('mudo');
   st.classList.toggle('velho', !online);
   document.getElementById('pendentes').textContent = d.pendentes;
@@ -394,7 +418,14 @@ function render(d){
     v.textContent = p.parseado ? brl(p.valor) : 'Valor não lido';
     const n = document.createElement('div'); n.className = 'nome'; n.textContent = p.pagador;
     const h = document.createElement('div'); h.className = 'hora'; h.textContent = p.hora;
-    dados.append(v, n, h);
+
+    // De qual loja veio. textContent, nunca innerHTML: o nome do pagador ao
+    // lado sai de e-mail, e a regra vale pra linha inteira.
+    const loja = document.createElement('div');
+    loja.className = 'loja ' + p.origem;
+    loja.textContent = p.origem_nome;
+
+    dados.append(v, n, h, loja);
 
     const b = document.createElement('button');
     b.className = 'btn' + (p.conferido ? ' ok' : '');

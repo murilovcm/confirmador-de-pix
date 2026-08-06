@@ -44,7 +44,6 @@ app.permanent_session_lifetime = timedelta(days=30)
 
 TZ = timezone(timedelta(hours=-3))
 DB_PATH = os.environ.get("DB_PATH", "/data/pix.db")
-INGEST_TOKEN = os.environ.get("INGEST_TOKEN", "")
 PAINEL_SENHA = os.environ.get("PAINEL_SENHA", "")
 SENHA_BRUTOS = os.environ.get("SENHA_BRUTOS", "")
 N8N_WEBHOOK = os.environ.get("N8N_WEBHOOK_URL", "").strip()
@@ -54,8 +53,48 @@ N8N_WEBHOOK = os.environ.get("N8N_WEBHOOK_URL", "").strip()
 # nenhum", nao "ponte caiu". Menor que a maior hora morta da loja = alarme falso.
 LIMITE_HEARTBEAT_MIN = int(os.environ.get("LIMITE_HEARTBEAT_MIN", "60"))
 
-# Nome da unica ponte que existe hoje: o workflow do n8n que le o Gmail.
-ORIGEM_PONTE = "email"
+# --------------------------------------------------------------------------
+# As origens — e o token de cada uma
+#
+# São dois sócios, duas contas Google e duas contas Nubank, mas UM painel só: os
+# Pix das duas caem na mesma lista, cada linha carimbada com o nome da loja.
+#
+# O TOKEN É A ORIGEM. Não existe campo "de qual loja é isto" em lugar nenhum da
+# requisição — quem responde essa pergunta é o token que autenticou. A diferença
+# não é elegância, é modo de falha:
+#
+#   origem declarada -> ponte mal configurada lança Pix na loja errada, e isso
+#                       passa despercebido porque a linha PARECE certa.
+#   origem do token  -> ponte mal configurada leva 401 e não entra nada. O
+#                       e-mail fica sem etiqueta e volta na rodada seguinte.
+#
+# De quebra, cada sócio guarda só o próprio token, e o gmail-apps-script.gs fica
+# IDÊNTICO nas duas contas — muda só a propriedade INGEST_TOKEN do projeto. Num
+# sistema onde ponte copiada e colada já ficou meses atrás do repositório (veja
+# VERSAO_PONTE no .gs), ter um arquivo só pra manter vale muito.
+#
+# INGEST_TOKEN continua sendo o da Vapor Store, com o mesmo nome de sempre: a
+# ponte que já roda hoje não precisa ser tocada pra continuar funcionando.
+ORIGENS = {
+    "murilo-vaporstore": {
+        "nome": "Vapor Store",
+        "token": os.environ.get("INGEST_TOKEN", ""),
+    },
+    "matheus-royal-podsilha": {
+        "nome": "Royal / Pods Ilha",
+        "token": os.environ.get("INGEST_TOKEN_ROYAL", ""),
+    },
+}
+
+# Pra onde vão as linhas que já existiam antes deste campo, e a ponte antiga
+# chamada "email". A Vapor Store era a única fonte até aqui.
+ORIGEM_ANTIGA = "murilo-vaporstore"
+
+
+def nome_origem(codigo: str) -> str:
+    """Rótulo curto, pro balcão. Origem desconhecida devolve o próprio código em
+    vez de vazio: linha sem carimbo é pior que linha com carimbo feio."""
+    return ORIGENS.get(codigo, {}).get("nome") or codigo or "?"
 
 # Hora em que o histórico é apagado. A loja já fechou, não há pedido em voo.
 HORA_LIMPEZA = int(os.environ.get("HORA_LIMPEZA", "2"))
@@ -66,7 +105,7 @@ VALIDADE_BRUTOS_MIN = 15
 # Marcador de build — serve pra provar qual versão do código está rodando
 # no container. Bumpar a cada deploy que precise ser verificado.
 # TEMPORÁRIO: remover junto com /saude/headers quando o 401 estiver resolvido.
-VERSAO = "nubank-3"
+VERSAO = "duas-origens-1"
 
 
 # --------------------------------------------------------------------------
@@ -83,7 +122,10 @@ CREATE TABLE IF NOT EXISTS pix (
     dedup_hash      TEXT NOT NULL UNIQUE,
     recebido_em     TEXT NOT NULL,
     conferido_em    TEXT,
-    conferido_por   TEXT
+    conferido_por   TEXT,
+    -- Qual loja recebeu. Vem do token que autenticou, nunca do corpo da
+    -- requisicao. Ver ORIGENS.
+    origem          TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_pix_recebido_em ON pix(recebido_em DESC);
 CREATE INDEX IF NOT EXISTS idx_pix_status ON pix(status);
@@ -141,6 +183,27 @@ def init_db():
     if "versao" not in {c[1] for c in con.execute("PRAGMA table_info(heartbeat)")}:
         con.execute("ALTER TABLE heartbeat ADD COLUMN versao TEXT")
         log.info("heartbeat: coluna 'versao' adicionada")
+
+    # Mesmo caso, pra coluna que diz de qual loja veio o Pix. O que já estava
+    # gravado é anterior ao Matheus entrar, então é tudo Vapor Store.
+    if "origem" not in {c[1] for c in con.execute("PRAGMA table_info(pix)")}:
+        con.execute("ALTER TABLE pix ADD COLUMN origem TEXT")
+        log.info("pix: coluna 'origem' adicionada")
+    con.execute("UPDATE pix SET origem = ? WHERE origem IS NULL", (ORIGEM_ANTIGA,))
+
+    # A ponte antiga se chamava "email", de quando existia uma só. Renomear em
+    # vez de deixar as duas: sem isso o painel mostraria uma ponte fantasma
+    # envelhecendo pra sempre ao lado da real. Mesmo motivo do DELETE acima.
+    #
+    # OR IGNORE + DELETE porque `origem` é PRIMARY KEY: se a ponte nova já tiver
+    # batido antes desta subida, as duas linhas existem ao mesmo tempo e o
+    # UPDATE puro estouraria com IntegrityError, derrubando o init_db inteiro.
+    # Nesse caso a linha nova é a boa e a velha vai embora.
+    con.execute(
+        "UPDATE OR IGNORE heartbeat SET origem = ? WHERE origem = 'email'",
+        (ORIGEM_ANTIGA,),
+    )
+    con.execute("DELETE FROM heartbeat WHERE origem = 'email'")
     con.commit()
     con.close()
     log.info("banco pronto em %s", DB_PATH)
@@ -428,14 +491,30 @@ def avisar_n8n(payload: dict):
 # Ingestão
 # --------------------------------------------------------------------------
 
-def token_valido() -> bool:
+def origem_do_token():
+    """Qual loja está mandando isto — ou None se o token não bate com nenhuma.
+
+    Autenticar e identificar a origem são a MESMA operação aqui, de propósito.
+    Ver o comentário em ORIGENS: origem que vem do token não tem como ser
+    declarada errada, e ponte mal configurada leva 401 em vez de lançar Pix na
+    loja errada.
+    """
     enviado = request.headers.get("X-Ingest-Token", "")
     if not enviado:
         # O Traefik do EasyPanel remove o X-Ingest-Token em requisições
         # externas; o Authorization: Bearer passa.
         auth = request.headers.get("Authorization", "")
         enviado = auth[7:] if auth.lower().startswith("bearer ") else auth
-    return bool(INGEST_TOKEN) and hmac.compare_digest(enviado, INGEST_TOKEN)
+
+    for codigo, cfg in ORIGENS.items():
+        # `if not cfg["token"]` antes da comparação, e não depois: origem sem
+        # token configurado tem o campo vazio, e sem esta guarda uma requisição
+        # sem Authorization nenhum casaria com ela.
+        if not cfg["token"]:
+            continue
+        if hmac.compare_digest(enviado, cfg["token"]):
+            return codigo
+    return None
 
 
 def extrair_texto() -> str:
@@ -452,7 +531,7 @@ def extrair_texto() -> str:
     return request.get_data(as_text=True) or ""
 
 
-def registrar_ping(origem=ORIGEM_PONTE):
+def registrar_ping(origem):
     # A ponte declara a versão dela na querystring. Fica gravada pra o /saude
     # conseguir responder "o código que está rodando no Google é o mesmo do
     # repositório?" — pergunta que já ficou sem resposta por meses e custou um
@@ -473,7 +552,10 @@ def registrar_ping(origem=ORIGEM_PONTE):
 
 @app.post("/ingest/pix")
 def ingest_pix():
-    if not token_valido():
+    # `origem` sai daqui e atravessa a função inteira. Não existe outro jeito de
+    # uma loja ser escolhida: nem querystring, nem corpo, nem header.
+    origem = origem_do_token()
+    if not origem:
         return jsonify(erro="nao autorizado"), 401
 
     texto = extrair_texto().strip()
@@ -484,9 +566,16 @@ def ingest_pix():
     agora = datetime.now(TZ)
 
     # DEDUP — o e-mail do Nubank não traz identificador de transação nenhum, e a
-    # chave é valor + nome + horário. Decisão consciente, com o custo anotado
-    # nos Limites do README: dois Pix do MESMO pagador, MESMO valor e MESMO
-    # minuto viram uma linha só, e o segundo é descartado.
+    # chave é origem + valor + nome + horário. Decisão consciente, com o custo
+    # anotado nos Limites do README: dois Pix do MESMO pagador, MESMO valor e
+    # MESMO minuto viram uma linha só, e o segundo é descartado.
+    #
+    # A ORIGEM entra na chave, e não é detalhe: são duas contas Nubank
+    # independentes, cada uma com a sua clientela. R$ 100 do "João" às 14h32 na
+    # Vapor e R$ 100 do "João" às 14h32 na Royal são dois Pix de verdade, e sem
+    # a origem na chave o segundo seria descartado em silêncio — some do painel
+    # e deixa só uma linha de log. É o pior modo de falha que este sistema tem,
+    # e com duas lojas ele deixaria de ser raro.
     #
     # O horário usado é o que o E-MAIL declara, não o instante em que ele
     # chegou aqui. Isso não é detalhe: a ponte reenvia o e-mail quando o POST
@@ -498,9 +587,9 @@ def ingest_pix():
     # de duplicata no reenvio — é o menos ruim entre não deduplicar nada.
     if status == "ok":
         referencia = quando or f"{agora:%Y%m%d%H%M}"
-        chave = f"{centavos}|{(pagador or '').lower()}|{referencia}"
+        chave = f"{origem}|{centavos}|{(pagador or '').lower()}|{referencia}"
     else:
-        chave = f"raw|{texto}"
+        chave = f"raw|{origem}|{texto}"
     dedup = hashlib.sha256(chave.encode("utf-8")).hexdigest()
 
     # A chave de dedup acima foi calculada com o texto INTEIRO; o que muda aqui
@@ -512,15 +601,15 @@ def ingest_pix():
     try:
         cur = db.execute(
             """INSERT INTO pix (valor_centavos, pagador, texto_bruto, status,
-                                dedup_hash, recebido_em)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (centavos, pagador, guardado, status, dedup, agora.isoformat()),
+                                dedup_hash, recebido_em, origem)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (centavos, pagador, guardado, status, dedup, agora.isoformat(), origem),
         )
         db.commit()
         novo_id = cur.lastrowid
     except sqlite3.IntegrityError:
         # Duplicado também prova que a ponte está viva.
-        registrar_ping()
+        registrar_ping(origem)
 
         # Devolve o status que a linha JÁ TEM, e não um "duplicado" genérico.
         #
@@ -540,7 +629,8 @@ def ingest_pix():
         anterior = linha["status"] if linha else "ok"
 
         if anterior != "ok":
-            log.info("reenvio de e-mail %s — continua fora do painel", anterior)
+            log.info("[%s] reenvio de e-mail %s — continua fora do painel",
+                     origem, anterior)
             return jsonify(status=anterior, duplicado=True), 200
 
         # Sem identificador de transação, "duplicado" é um palpite: quase sempre
@@ -548,7 +638,8 @@ def ingest_pix():
         # mesmo valor e mesmo minuto sendo descartado. Fica no log com valor e
         # nome pra dar o que conferir quando o fechamento não bater — é o único
         # rastro que esse caso deixa.
-        log.warning("duplicado descartado | %s | %s | %s", centavos, pagador, quando)
+        log.warning("duplicado descartado | %s | %s | %s | %s",
+                    origem, centavos, pagador, quando)
         return jsonify(status="duplicado"), 200
 
     # O relógio do painel anda a cada e-mail que chega, e só. Não existe ping
@@ -556,8 +647,8 @@ def ingest_pix():
     # nada quebrado. É o desenho escolhido — LIMITE_HEARTBEAT_MIN é o que separa
     # "hora parada" de "ponte morta", e precisa ser maior que a maior hora morta
     # normal da loja, senão vira alarme falso diário.
-    registrar_ping()
-    log.info("pix %s | %s | %s", status, centavos, pagador)
+    registrar_ping(origem)
+    log.info("pix %s | %s | %s | %s", origem, status, centavos, pagador)
 
     if status == "ok":
         avisar_n8n({
@@ -568,6 +659,11 @@ def ingest_pix():
             "recebido_em": agora.isoformat(),
             "hora": agora.strftime("%H:%M"),
             "canal": "nubank",
+            # Quem consome precisa saber de qual loja é o dinheiro. `canal`
+            # continua sendo o BANCO — se um dia entrar um segundo banco, os
+            # dois campos passam a variar de forma independente.
+            "origem": origem,
+            "origem_nome": nome_origem(origem),
         })
 
     return jsonify(status=status, valor=centavos, pagador=pagador), 200
@@ -575,9 +671,10 @@ def ingest_pix():
 
 @app.post("/ingest/ping")
 def ingest_ping():
-    if not token_valido():
+    origem = origem_do_token()
+    if not origem:
         return jsonify(erro="nao autorizado"), 401
-    registrar_ping()
+    registrar_ping(origem)
     return jsonify(status="ok"), 200
 
 
@@ -639,7 +736,8 @@ def api_pix():
     # aparecem no balcão. Status novo tem que ser adicionado aqui de propósito,
     # nunca herdar a vaga por descuido.
     linhas = db.execute(
-        """SELECT id, valor_centavos, pagador, status, recebido_em, conferido_em
+        """SELECT id, valor_centavos, pagador, status, recebido_em, conferido_em,
+                  origem
            FROM pix
            WHERE recebido_em >= ? AND status IN ('ok', 'sem_valor')
            ORDER BY recebido_em DESC LIMIT 80""",
@@ -653,11 +751,23 @@ def api_pix():
         minutos = int((agora - datetime.fromisoformat(p["ultimo_ping"])).total_seconds() / 60)
         pontes.append({
             "origem": p["origem"],
+            # O painel precisa NOMEAR a ponte atrasada: com duas lojas,
+            # "última atualização há 2 horas" não diz de quem é o problema.
+            "nome": nome_origem(p["origem"]),
             "minutos": minutos,
             "online": minutos < LIMITE_HEARTBEAT_MIN,
         })
-    if not pontes:
-        pontes = [{"origem": ORIGEM_PONTE, "minutos": 999, "online": False}]
+    # Uma ponte que nunca bateu não tem linha no heartbeat, e ficaria invisível.
+    # Aqui ela aparece como offline — que é a verdade: ninguém sabe nada dela.
+    conhecidas = {p["origem"] for p in pontes}
+    for codigo in ORIGENS:
+        if codigo not in conhecidas:
+            pontes.append({
+                "origem": codigo,
+                "nome": nome_origem(codigo),
+                "minutos": 999,
+                "online": False,
+            })
 
     pix = [{
         "id": l["id"],
@@ -666,8 +776,12 @@ def api_pix():
         "parseado": l["status"] == "ok",
         "hora": datetime.fromisoformat(l["recebido_em"]).strftime("%H:%M"),
         "conferido": bool(l["conferido_em"]),
+        "origem": l["origem"] or ORIGEM_ANTIGA,
+        "origem_nome": nome_origem(l["origem"] or ORIGEM_ANTIGA),
     } for l in linhas]
 
+    # Contagem GLOBAL, das duas lojas somadas: é ela que decide se o alerta
+    # toca, e a decisão de operação é que todo tablet apita por qualquer Pix.
     pendentes = sum(1 for p in pix if not p["conferido"])
 
     return jsonify(pontes=pontes, pix=pix, pendentes=pendentes)
@@ -729,20 +843,26 @@ def brutos():
     # existe justamente pra ele ser encontrado. Sobra a contagem, que é o que
     # importa saber: se ela disparar num dia sem Pix, a triagem é que errou.
     linhas = db.execute(
-        """SELECT id, status, recebido_em, texto_bruto FROM pix
+        """SELECT id, status, recebido_em, texto_bruto, origem FROM pix
            WHERE status NOT IN ('ok', 'ignorado')
            ORDER BY id DESC LIMIT 50"""
     ).fetchall()
+    # Contagem do ruído POR LOJA: são duas caixas de e-mail independentes, e
+    # saber em qual delas o volume disparou é o que diz onde procurar.
     ruido = db.execute(
-        "SELECT COUNT(*) FROM pix WHERE status = 'ignorado'"
-    ).fetchone()[0]
+        """SELECT origem, COUNT(*) AS n FROM pix
+           WHERE status = 'ignorado' GROUP BY origem"""
+    ).fetchall()
 
     corpo = "\n\n".join(
-        f"--- #{l['id']} | {l['status']} | {l['recebido_em']} ---\n{l['texto_bruto']}"
+        f"--- #{l['id']} | {nome_origem(l['origem'])} | {l['status']} | "
+        f"{l['recebido_em']} ---\n{l['texto_bruto']}"
         for l in linhas
     ) or "Nada pendente."
+
+    resumo = ", ".join(f"{r['n']} em {nome_origem(r['origem'])}" for r in ruido) or "nenhuma"
     corpo += (
-        f"\n\n--- {ruido} comunicação(ões) comum(ns) do Nubank no período ---\n"
+        f"\n\n--- Comunicação comum do Nubank no período: {resumo} ---\n"
         "Texto não guardado. Se alguma delas for um comprovante, ela está "
         "inteira no Gmail em label:caixa-ruido — remova a etiqueta e a ponte "
         "reprocessa."
@@ -759,22 +879,27 @@ def brutos():
 
 @app.get("/saude")
 def saude():
-    """`versao` é o servidor; `ponte` é o que o Apps Script declarou na última
-    vez que mandou um e-mail. São dois códigos com ciclos de vida separados: um
-    sobe por deploy, o outro por copiar e colar dentro do script.google.com. Ver
-    os dois lado a lado é o jeito de flagrar que um ficou pra trás."""
+    """`versao` é o servidor; `pontes` é o que cada Apps Script declarou na
+    última vez que mandou um e-mail. São códigos com ciclos de vida separados: o
+    servidor sobe por deploy, cada ponte por copiar e colar dentro do
+    script.google.com. Ver todos lado a lado é o jeito de flagrar que um ficou
+    pra trás — e com duas contas isso passa a poder acontecer em cada uma
+    separadamente.
+
+    `null` numa ponte significa "nunca mandou nada" — ou ela não foi instalada,
+    ou o token dela está errado e está tomando 401."""
     con = sqlite3.connect(DB_PATH, timeout=10)
     try:
-        linha = con.execute(
-            "SELECT versao FROM heartbeat WHERE origem = ?", (ORIGEM_PONTE,)
-        ).fetchone()
+        linhas = con.execute("SELECT origem, versao FROM heartbeat").fetchall()
     finally:
         con.close()
+
+    vistas = {origem: versao for origem, versao in linhas}
     return jsonify(
         ok=True,
         hora=datetime.now(TZ).isoformat(),
         versao=VERSAO,
-        ponte=(linha[0] if linha else None),
+        pontes={codigo: vistas.get(codigo) for codigo in ORIGENS},
     )
 
 
@@ -793,8 +918,17 @@ def saude_headers():
         authorization_chegou=bool(auth),
         authorization_len=len(auth),
         authorization_tem_prefixo_bearer=auth.lower().startswith("bearer "),
-        ingest_token_configurado=bool(INGEST_TOKEN),
-        ingest_token_len=len(INGEST_TOKEN),
+        # Por origem, desde que passaram a ser duas: o sintoma mais provável de
+        # 401 agora é uma delas ter ficado sem token configurado no EasyPanel.
+        # Continua sem dizer se o token ENVIADO bate — isto informa configuração,
+        # não é oráculo de senha.
+        tokens={
+            codigo: {
+                "configurado": bool(cfg["token"]),
+                "len": len(cfg["token"]),
+            }
+            for codigo, cfg in ORIGENS.items()
+        },
     )
 
 
