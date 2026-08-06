@@ -96,6 +96,10 @@ No passo 1, confira também o campo `versao` — é o que prova qual código est
 rodando no container. Se ele não bateu com o que você acabou de subir, o deploy
 não pegou e o resto do teste está medindo código velho.
 
+O campo `ponte` do mesmo `/saude` faz o mesmo pela ponte do Gmail, e vem `null`
+até ela mandar o primeiro e-mail. Veja *As duas versões* na seção 9 — essa
+distinção já custou um Pix.
+
 Depois abre `https://caixa.seudominio.com`, entra com a `PAINEL_SENHA`, e o
 Pix de teste tem que estar lá.
 
@@ -136,36 +140,52 @@ carregar o token do caixa junto.
 
 ### 4.3. Conferir o filtro
 
-`REMETENTE` e `ASSUNTO` já vêm prontos: `todomundo@nubank.com.br` e o pedaço de
-assunto **`Você recebeu`**.
+`REMETENTE` é `nubank.com.br` — o domínio inteiro. **Não existe filtro de
+assunto, e isso é intencional.**
 
-O assunto é curto de propósito, e isso custou um Pix pra aprender. O Nubank usa
-**pelo menos dois assuntos** pro mesmo evento — `Você recebeu uma transferência
-via Pix` e `Você recebeu uma transferência` — e o filtro original, colado do
-primeiro comprovante, era exato demais pro segundo. Como o Gmail casa por frase
-**contida** no assunto, o pedaço curto pega os dois e aguenta a próxima variante.
+O assunto já escondeu comprovante duas vezes. A primeira, um filtro exato demais
+(`Você recebeu uma transferência via Pix`) que não enxergava a segunda variante.
+A segunda, um Pix de R$ 176 que ficou de fora enquanto o conserto da primeira
+existia no repositório e **nunca tinha sido colado no Apps Script** — o filtro
+antigo continuou rodando por meses.
 
-> **Este filtro é o ponto cego do sistema.** E-mail que não casa aqui não gera
-> etiqueta, não vai pro `/brutos` e não aparece em lugar nenhum — some sem
-> rastro. As etiquetas de revisão só protegem o que consegue entrar. Se um
-> comprovante sumir sem deixar pista, **desconfie do filtro antes do parser.**
+As duas têm a mesma raiz: o assunto é a parte do e-mail que o banco troca sem
+avisar, e um filtro do lado do Gmail **descarta sem deixar rastro**. Encurtar a
+frase só adiava a próxima mordida.
+
+Agora a ponte não decide nada. Ela pega tudo do domínio do Nubank e manda pro
+servidor, que é o único lugar onde uma decisão errada é recuperável: lá o e-mail
+vira linha no `/brutos`, ganha etiqueta e volta pra fila quando você quiser.
+Toda regra de "isto é dinheiro" mora no `e_nubank()` do `app.py`.
+
+> **Nunca reponha um filtro de assunto ou de conteúdo aqui.** Nem "só pra
+> diminuir o ruído": o ruído já tem lugar (`caixa-ruido`), e o que passa por
+> este filtro é a única coisa que o sistema é capaz de enxergar.
 
 Rode a função **`testarBusca`** (menu de funções → *Executar*). Na primeira
 execução o Google pede autorização: *Revisar permissões* → escolher a conta →
 *Avançado* → *Acessar Coletor de Pix (não seguro)* → *Permitir*. O aviso de "app
 não verificado" é esperado — o app não verificado é o seu próprio script.
 
-O log abre com um **VEREDITO** que responde a única pergunta que importa:
+O log abre com a versão da ponte e um **VEREDITO** que diz onde aquele e-mail
+vai parar:
 
 ```
-marcador 1 "Você recebeu um Pix de": ACHOU
-marcador 2 "Valor Recebido": ACHOU
+versão desta ponte: ponte-3  (compare com o campo "ponte" do /saude)
+marcador 1 "recebeu um Pix / uma transferência de": ACHOU
+marcador 2 "Valor recebido": ACHOU
+sinal 3 "R$ ... DD MMM às HH:MM": ACHOU
 pagador: MATHEUS SANTANA CANEJO
 horário do e-mail (chave de dedup): 05 AGO às 18:51
+--> Vira Pix no painel. Etiqueta: caixa-enviado
 ```
 
-Os **dois marcadores precisam dar ACHOU**, senão o coletor ignora o e-mail. E o
-horário precisa aparecer: é ele que segura a dedup, como explicado na seção 9.
+Os **dois marcadores precisam dar ACHOU** pra virar dinheiro. O horário também:
+é ele que segura a dedup, como explicado na seção 9.
+
+Como a busca agora pega tudo do Nubank, é normal o `testarBusca` cair numa
+newsletter e responder `--> Comunicação comum do Nubank`. Não é defeito — é a
+triagem trabalhando. Rode de novo depois de receber um Pix de verdade.
 
 ### 4.4. Enviar um de verdade
 
@@ -192,20 +212,31 @@ Manda R$ 0,01 de outra conta pro seu Nubank. Em até um minuto o painel apita.
 Se aparecer "Valor não lido", o texto cru está em `/brutos` — é de lá que sai o
 ajuste do regex, e **no mesmo dia**, porque às 2h ele é apagado.
 
-### As duas etiquetas
+### As três etiquetas
 
 A ponte marca no Gmail o que já processou, e a etiqueta diz **o que o coletor
 respondeu**:
 
-| Etiqueta | Significa |
-|---|---|
-| `caixa-enviado` | Virou Pix no painel (ou já estava lá) |
-| `caixa-revisar` | Chegou no servidor, mas o parser **não reconheceu** |
-| *(sem etiqueta)* | Não chegou — erro de rede, 401, servidor fora. Volta na próxima rodada |
+| Etiqueta | Significa | Você olha? |
+|---|---|---|
+| `caixa-enviado` | Virou Pix no painel (ou já estava lá) | Não |
+| `caixa-revisar` | Tem cara de comprovante e o parser **não conseguiu ler** | **Sim** |
+| `caixa-ruido` | Comunicação comum do Nubank — fatura, promoção, extrato | Não |
+| *(sem etiqueta)* | Não chegou — erro de rede, 401, servidor fora. Volta na próxima rodada | — |
 
-Essa separação existe porque **o coletor responde 200 nos dois primeiros
+Essa separação existe porque **o coletor responde 200 nos três primeiros
 casos.** Com uma etiqueta só, um e-mail que o parser não entendeu era marcado
 como resolvido e nunca mais voltava.
+
+A terceira nasceu junto com a busca larga. Sem ela, a newsletter do Nubank
+cairia em `caixa-revisar` e afogaria o comprovante de verdade — o mesmo sumiço
+de antes, só que numa etiqueta em vez de na caixa de entrada. Quem decide entre
+revisar e ruído é a `triagem` do `app.py`, e ela é **palpite, não porteiro**:
+errar não perde e-mail, só guarda na gaveta errada.
+
+Numa thread com mensagens de tipos diferentes, vale a **mais grave**:
+`caixa-revisar` > `caixa-enviado` > `caixa-ruido`. O Gmail agrupa conversas, e
+marcar a thread inteira como ruído esconderia o comprovante do meio dela.
 
 Isso não é hipótese: aconteceu na virada do PicPay pro Nubank. A ponte foi
 atualizada antes do servidor, mandou comprovantes do Nubank pro parser antigo,
@@ -214,7 +245,14 @@ subiu, não havia mais nada pra reprocessar. Os Pix ficaram só no `/brutos`.
 
 **Para reprocessar**, busque `label:caixa-revisar` no Gmail, remova a etiqueta e
 espere um minuto. A ponte pega de novo. Vale pra qualquer e-mail etiquetado —
-remover a etiqueta é sempre o jeito de devolver um e-mail pra fila.
+remover a etiqueta é sempre o jeito de devolver um e-mail pra fila, inclusive em
+`caixa-ruido`.
+
+E o reprocessamento agora é honesto: um e-mail reenviado que **continua** sem
+ser reconhecido volta pra fila de revisão, em vez de ser marcado como resolvido.
+Antes o servidor respondia `duplicado` pra qualquer texto repetido, então tirar a
+etiqueta depois de mexer no regex marcava o e-mail como pronto — mesmo quando o
+conserto não tinha pegado.
 
 > Sempre que ajustar o parser, olhe o `label:caixa-revisar` antes das 2h. É a
 > fila de e-mails que entraram como `ignorado` e ainda podem virar Pix.
@@ -409,9 +447,53 @@ marcador só não basta.
 Isso importa mais aqui do que parece: **metade do e-mail do Nubank é
 propaganda.** O bloco "Com o Nubank, você tem mais praticidade na hora de fazer
 um Pix" cita Pix cinco vezes, e nenhuma delas é dinheiro entrando. Com uma lista
-branca frouxa, um e-mail de marketing viraria Pix falso no painel. Qualquer
-coisa que não case com os dois marcadores vai pro `/brutos` como `ignorado` e
-**nunca** conta como recebimento.
+branca frouxa, um e-mail de marketing viraria Pix falso no painel.
+
+### Triagem: o que fazer com o que não passou
+
+Como a ponte manda **tudo** que o Nubank escreve, o que fica de fora da lista
+branca ainda precisa ser separado — senão a fila de revisão vira caixa de
+entrada. São dois destinos, e a diferença é só se o texto tem cara de
+comprovante:
+
+| Status | Quando | Etiqueta | Aparece no painel |
+|---|---|---|---|
+| `suspeito` | Acertou **pelo menos um** dos três sinais | `caixa-revisar` | Não |
+| `ignorado` | Não acertou nenhum | `caixa-ruido` | Não |
+
+Os três sinais:
+
+1. a abertura — `recebeu um Pix de` / `recebeu uma transferência de`
+2. o rótulo `valor recebido`
+3. **a cifra colada num carimbo de hora** — `R$ 176,00  06 AGO às 11:38`
+
+O terceiro é o mais valioso, e é o que fecha o buraco de verdade: ele **não
+depende de uma palavra sequer da redação**. Se o Nubank reescrever o e-mail
+inteiro — título novo, frase nova, rótulo novo — e mantiver só o cartãozinho
+cinza com valor e hora, o comprovante ainda cai em `caixa-revisar` em vez de
+sumir. Já a fatura ("R$ 1.240,00, vence em 10 AGO") não tem hora e não dispara.
+
+**Isso é triagem, não porteiro.** Errar aqui não perde e-mail nenhum: os dois
+status ganham etiqueta no Gmail, e remover a etiqueta devolve o e-mail pra fila.
+A garantia é *nada desaparece*; acertar a gaveta é conforto.
+
+### O que o funcionário vê — e o que ele não vê
+
+Com a rede larga, a correspondência inteira do banco passa pelo servidor. Ela
+**não chega no balcão**, e por dois mecanismos independentes:
+
+- O `/api/pix` usa **lista de permissão** (`status IN ('ok','sem_valor')`), não
+  lista de exclusão. Status novo não herda a vaga por descuido — tem que ser
+  adicionado ali de propósito.
+- O texto do que entra como `ignorado` **nem é gravado**. Só fica a marca de que
+  passou, e o `/brutos` mostra a contagem em vez do conteúdo. Fatura, limite e
+  proposta de empréstimo não existem dentro do banco de dados; texto que não é
+  guardado não vaza.
+
+Se um comprovante cair em `ignorado` por engano, o texto dele está inteiro no
+Gmail sob `label:caixa-ruido` — que é o caminho de recuperação de verdade. O
+`/brutos` sempre foi conveniência pra calibrar regex, nunca o lugar onde o
+e-mail se salva.
 
 ### O e-mail é HTML puro — não existe `text/plain`
 
@@ -463,20 +545,48 @@ O custo dessa escolha está nos *Limites conhecidos*, e é real. Leia.
 
 ### Quando o Nubank mudar o texto
 
-1. Copia o texto cru de `/brutos` **no mesmo dia** (às 2h ele some)
+1. Copia o texto cru de `/brutos` **no mesmo dia** (às 2h ele some). Se o e-mail
+   não estiver lá, procura `label:caixa-ruido` no Gmail — a triagem pode ter
+   errado a gaveta, e o texto do que vira ruído não é guardado no servidor
 2. Ajusta o regex correspondente no `app.py` — os nomes começam com `NUBANK_`
 3. Roda o `testarBusca` no Apps Script: o veredito diz na hora se voltou a casar
 4. Deploy, e bumpa o `VERSAO` pra conseguir provar pelo `/saude` que subiu
 5. **No Gmail, busca `label:caixa-revisar` e remove a etiqueta** — a ponte
-   reprocessa os e-mails que tinham entrado como `ignorado`
+   reprocessa os e-mails que tinham entrado como `suspeito`
 
 O passo 5 é o que transforma o conserto do regex em Pix no painel. Sem ele,
 você arruma o parser e os comprovantes antigos continuam de fora.
+
+Se você mexeu no `.gs` em vez do `app.py`, o passo 4 é outro: colar o arquivo no
+`script.google.com` **e bumpar o `VERSAO_PONTE`**. Deploy não leva o `.gs` junto.
 
 > **Ordem do deploy:** servidor primeiro, Apps Script depois. Ponte nova
 > mandando pra servidor velho recebe `ignorado` com status 200 — e aí os
 > comprovantes vão parar no `caixa-revisar` em vez do painel. Não é perda
 > definitiva (é pra isso que a etiqueta existe), mas é meia hora de susto.
+
+### As duas versões, e por que elas existem
+
+`/saude` devolve dois campos, e eles são de **códigos diferentes**:
+
+```json
+{ "versao": "nubank-3", "ponte": "ponte-3" }
+```
+
+`versao` é o servidor, que sobe por deploy. `ponte` é o `VERSAO_PONTE` que o
+Apps Script declarou da última vez que mandou um e-mail — e esse **não sobe por
+deploy nenhum**: o `gmail-apps-script.gs` é copiado e colado à mão dentro do
+`script.google.com`, e o Google não tem ideia de que este repositório existe.
+
+Foi exatamente aí que o Pix de R$ 176 se perdeu. O filtro de assunto tinha sido
+corrigido no repositório (commit `a7ea593`), a correção estava certa, e a ponte
+no Google continuou meses rodando a versão antiga. **O conserto existia e não
+estava rodando**, e nada no sistema reclamava.
+
+Por isso: **toda vez que colar o `.gs` no Apps Script, bumpe o `VERSAO_PONTE`**,
+e confira no `/saude` que o campo `ponte` mudou. Se ele não bater com o valor do
+arquivo, o que está rodando lá é código velho — e é o primeiro lugar pra olhar
+quando um comprovante sumir.
 
 O importante: **e-mail não reconhecido nunca vira confirmação de dinheiro.**
 Ele é guardado e fica visível, mas não aparece como Pix confirmado no painel.
@@ -488,13 +598,19 @@ Ele é guardado e fica visível, mas não aparece como Pix confirmado no painel.
 **Não é fonte de verdade.** É tela de conferência. O rodapé instrui a conferir no
 app em caso de dúvida ou valor alto — mantenha esse texto.
 
+**A ponte não tem deploy — ela tem copiar e colar.** É o ponto mais frágil do
+sistema hoje, e o que já custou um Pix: o `.gs` corrigido no repositório não
+chega no Google sozinho, e ninguém percebe a diferença. O campo `ponte` do
+`/saude` existe pra tornar isso visível, mas ele só **denuncia** a deriva —
+não impede. Confira depois de toda alteração no `.gs`.
+
 **Canal único, e frágil em pontos que não são seus.** Gmail, autorização do
 script e cota do Apps Script: qualquer um dos três parando derruba a coleta
 inteira. Não existe backup local como havia no celular — o e-mail continua na
 caixa, mas ninguém o lê sozinho depois.
 
 O consolo é que o e-mail **não se perde**: se a ponte ficou dias fora, é só
-tirar as etiquetas `caixa-enviado` / `caixa-revisar` das conversas e alargar o
+tirar as etiquetas `caixa-enviado` / `caixa-revisar` / `caixa-ruido` e alargar o
 `newer_than` da busca que o script reenvia tudo. A dedup segura o que já tinha
 entrado, porque a chave usa o horário declarado no e-mail e não muda com o
 reenvio.

@@ -12,45 +12,90 @@
  * Instalação: veja a seção 4 do README.
  */
 
-// O filtro é a barreira mais perigosa do sistema inteiro, e já mordeu uma vez:
-// e-mail que não casa aqui NÃO gera etiqueta, NÃO vai pro /brutos e NÃO aparece
-// em lugar nenhum. Some sem rastro. As etiquetas de revisão só protegem o que
-// consegue entrar — filtro estreito é um ponto cego que nem log deixa.
+// ESTA BUSCA NÃO DECIDE NADA, E É DE PROPÓSITO.
 //
-// Por isso o assunto é curto de propósito. O Nubank usa pelo menos dois
-// assuntos pro mesmo evento ("Você recebeu uma transferência via Pix" e
-// "Você recebeu uma transferência"), e o Gmail casa por frase CONTIDA: o
-// pedaço abaixo pega os dois e aguenta a próxima variante que eles inventarem.
+// Ela já foi o ponto cego do sistema inteiro, e cobrou duas vezes. E-mail que
+// não casa aqui NÃO gera etiqueta, NÃO vai pro /brutos e NÃO aparece em lugar
+// nenhum: some sem rastro, e nem log fica. As etiquetas de revisão só protegem
+// o que consegue entrar.
 //
-// O preço é ruído: promocional que comece com "Você recebeu" cai no
-// caixa-revisar. Ruído visível é barato; comprovante invisível, não.
-var REMETENTE = 'todomundo@nubank.com.br';
-var ASSUNTO = 'Você recebeu';
+// A segunda mordida foi um Pix de R$ 176. A busca exigia "Você recebeu" no
+// ASSUNTO; o Nubank mandou a variante "transferência" com outro assunto, e o
+// comprovante nunca existiu pra este sistema. A primeira mordida tinha sido a
+// mesma coisa com um assunto mais longo, e a correção da época — encurtar a
+// frase — só adiou o problema, porque o assunto é justamente a parte do e-mail
+// que o banco troca sem avisar ninguém.
+//
+// Por isso não existe mais filtro de assunto NEM de conteúdo. A busca pega tudo
+// que vem do domínio do Nubank e manda pro servidor, que é o único lugar onde
+// uma decisão errada deixa rastro: lá o e-mail vira linha no /brutos, ganha
+// etiqueta e pode ser reprocessado. Toda regra de "isto é dinheiro" mora no
+// e_nubank() do app.py, e uma cópia dela aqui não filtraria melhor — só moveria
+// o veredito pro único lugar onde errar é invisível.
+//
+// O domínio inteiro, e não `todomundo@`: o endereço de origem é tão trocável
+// quanto o assunto, e a triagem do servidor absorve o remetente novo de graça.
+//
+// O preço é ruído — o Nubank manda toda a comunicação dele por aqui. Quem paga
+// esse preço é a etiqueta caixa-ruido, logo abaixo.
+var REMETENTE = 'nubank.com.br';
 
-// DUAS etiquetas, e a diferença entre elas já custou Pix.
+// TRÊS etiquetas, e a diferença entre elas já custou Pix.
 //
 // O coletor responde 200 tanto pro Pix reconhecido quanto pro e-mail que ele
-// não entendeu ("ignorado"). Com uma etiqueta só, os dois eram marcados como
-// resolvidos e nunca mais voltavam — foi o que aconteceu quando a ponte rodou
-// contra um servidor que ainda não conhecia o formato do Nubank: os e-mails
-// foram etiquetados, o parser foi corrigido, e não sobrou nada pra reprocessar.
+// não entendeu. Com uma etiqueta só, os dois eram marcados como resolvidos e
+// nunca mais voltavam — foi o que aconteceu quando a ponte rodou contra um
+// servidor que ainda não conhecia o formato do Nubank: os e-mails foram
+// etiquetados, o parser foi corrigido, e não sobrou nada pra reprocessar.
 //
-// Agora o que o parser não entendeu vai pra uma fila VISÍVEL. Depois de ajustar
-// o regex, `label:caixa-revisar` no Gmail acha tudo; removeu a etiqueta, a ponte
-// reprocessa sozinha na rodada seguinte.
+//   caixa-enviado -> virou Pix no painel (ou já estava lá)
+//   caixa-revisar -> o servidor achou cara de comprovante e não conseguiu ler.
+//                    É A FILA QUE VOCÊ OLHA. Ajuste o regex e remova a etiqueta.
+//   caixa-ruido   -> comunicação comum do banco. Ninguém olha.
+//
+// A terceira nasceu junto com a busca larga. Sem ela, a newsletter do Nubank
+// cairia em caixa-revisar e afogaria o comprovante de verdade — o mesmo sumiço
+// de antes, só que numa etiqueta em vez de na caixa de entrada.
+//
+// Quem decide entre revisar e ruído é o servidor (`triagem` no app.py), não
+// esta ponte. E ninguém aqui é definitivo: remover QUALQUER uma das três
+// etiquetas devolve o e-mail pra fila na rodada seguinte.
 var ETIQUETA_ENVIADO = 'caixa-enviado';
 var ETIQUETA_REVISAR = 'caixa-revisar';
+var ETIQUETA_RUIDO = 'caixa-ruido';
+
+// Marcador de versão da ponte. BUMPE A CADA VEZ QUE COLAR ESTE ARQUIVO AQUI.
+//
+// Ele existe porque este arquivo não é "deployado": ele é COPIADO E COLADO
+// dentro do script.google.com, na mão, e o Google não tem ideia de que o
+// repositório existe. Corrigir o código aqui e esquecer de colar lá deixa os
+// dois em versões diferentes, e nada no sistema reclama.
+//
+// Já aconteceu, e foi o que custou o Pix de R$ 176. O filtro de assunto tinha
+// sido consertado no repositório meses antes; a ponte no Google continuou com
+// a versão antiga, enxergando um formato só. O conserto existia e não estava
+// rodando.
+//
+// A ponte manda isto em toda requisição, o servidor guarda, e o /saude devolve
+// os dois lado a lado. Se `ponte` no /saude não bater com o valor daqui, o que
+// está rodando no Google é código velho — e é aí que se olha primeiro quando
+// um comprovante sumir.
+var VERSAO_PONTE = 'ponte-3';
 
 // Teto por rodada. Um pico de e-mail não pode fazer uma execução estourar o
 // tempo e ser morta no meio: o que sobrar vai na próxima, um minuto depois.
+// Importa mais desde a busca larga — na primeira rodada depois de subir esta
+// versão, dois dias inteiros de e-mail do Nubank estão sem etiqueta e entram
+// de uma vez. Vão em lotes de 15, um minuto de cada vez, e acabam sozinhos.
 var MAX_POR_RODADA = 15;
 
 // newer_than corta a busca. Sem ele, um dia de etiqueta apagada por engano
 // faria o script varrer a caixa inteira e reenviar o histórico todo.
 function busca_() {
-  return 'from:(' + REMETENTE + ') subject:("' + ASSUNTO + '") ' +
+  return 'from:(' + REMETENTE + ') ' +
          '-label:' + ETIQUETA_ENVIADO +
-         ' -label:' + ETIQUETA_REVISAR + ' newer_than:2d';
+         ' -label:' + ETIQUETA_REVISAR +
+         ' -label:' + ETIQUETA_RUIDO + ' newer_than:2d';
 }
 
 
@@ -119,8 +164,15 @@ function texto_(msg) {
  * fez a ponte marcar como resolvido um comprovante que nunca chegou no painel.
  *
  *   'ok' | 'duplicado'         -> entrou (ou já estava lá)
- *   'ignorado' | 'sem_valor'   -> chegou no servidor, mas não virou dinheiro
+ *   'sem_valor' | 'suspeito'   -> tem cara de comprovante e não foi lido
+ *   'ignorado'                 -> comunicação comum do banco
  *   'erro'                     -> não chegou; a próxima rodada tenta de novo
+ *
+ * Repare que 'duplicado' só volta pra linha que está no painel como Pix. Um
+ * e-mail reenviado que continua sem ser reconhecido devolve o status REAL
+ * ('suspeito', 'sem_valor'...), e não 'duplicado' — sem isso, reprocessar um
+ * e-mail depois de mexer no regex o marcava como resolvido mesmo quando o
+ * conserto não tinha pegado.
  *
  * Reenviar em caso de 'erro' é seguro porque a chave de dedup do coletor usa o
  * horário que o E-MAIL declara, não a hora em que ele chegou lá. Se usasse a
@@ -128,7 +180,13 @@ function texto_(msg) {
  * entraria duas vezes — o retry só é barato por causa disso.
  */
 function enviar_(corpo) {
-  var resp = UrlFetchApp.fetch(propriedade_('CAIXA_URL') + '/ingest/pix', {
+  // A versão vai na URL, e não num header: o Traefik do EasyPanel remove
+  // headers "X-" em requisição externa, e um marcador que some no caminho não
+  // serve pra provar nada.
+  var url = propriedade_('CAIXA_URL') + '/ingest/pix?ponte=' +
+            encodeURIComponent(VERSAO_PONTE);
+
+  var resp = UrlFetchApp.fetch(url, {
     method: 'post',
     contentType: 'text/plain; charset=utf-8',
     // Authorization, não X-Ingest-Token: o Traefik do EasyPanel remove headers
@@ -165,9 +223,9 @@ function enviar_(corpo) {
     return 'erro';
   }
 
-  if (status === 'ignorado' || status === 'sem_valor') {
-    Logger.log('ATENÇÃO: o coletor NÃO reconheceu este e-mail como Pix. ' +
-               'Vai pra etiqueta "' + ETIQUETA_REVISAR + '".');
+  if (status === 'suspeito' || status === 'sem_valor') {
+    Logger.log('ATENÇÃO: este e-mail tem cara de comprovante e o coletor NÃO ' +
+               'conseguiu lê-lo. Vai pra etiqueta "' + ETIQUETA_REVISAR + '".');
   }
   return status || 'erro';
 }
@@ -186,7 +244,8 @@ function coletar() {
   for (var i = 0; i < threads.length; i++) {
     var msgs = threads[i].getMessages();
     var houveErro = false;
-    var houveNaoReconhecido = false;
+    var houveRevisar = false;
+    var houvePix = false;
 
     // Percorre todas as mensagens da conversa, não só a última: se o Gmail
     // agrupar dois comprovantes na mesma thread, etiquetar sem ler as duas
@@ -200,7 +259,8 @@ function coletar() {
         status = 'erro';
       }
       if (status === 'erro') houveErro = true;
-      else if (status !== 'ok' && status !== 'duplicado') houveNaoReconhecido = true;
+      else if (status === 'ok' || status === 'duplicado') houvePix = true;
+      else if (status !== 'ignorado') houveRevisar = true;
     }
 
     // Erro manda a conversa INTEIRA de volta pra fila, sem etiqueta nenhuma: é
@@ -208,11 +268,15 @@ function coletar() {
     // um Pix é pior que reenviar (a dedup absorve o reenvio do resto).
     if (houveErro) continue;
 
-    // Chegou no servidor, mas alguma mensagem não virou Pix: vai pra fila de
-    // revisão em vez de sumir como se estivesse resolvida.
-    threads[i].addLabel(etiqueta_(
-      houveNaoReconhecido ? ETIQUETA_REVISAR : ETIQUETA_ENVIADO
-    ));
+    // A etiqueta da conversa é a da mensagem MAIS GRAVE dentro dela, porque o
+    // Gmail agrupa e uma thread pode misturar comprovante com propaganda.
+    // Ordem: revisar > enviado > ruído. Marcar uma conversa como ruído por
+    // causa da maioria esconderia o comprovante que está no meio dela.
+    var etiqueta = ETIQUETA_RUIDO;
+    if (houveRevisar) etiqueta = ETIQUETA_REVISAR;
+    else if (houvePix) etiqueta = ETIQUETA_ENVIADO;
+
+    threads[i].addLabel(etiqueta_(etiqueta));
   }
 }
 
@@ -245,15 +309,18 @@ function instalarGatilho() {
  * enterrado embaixo de 2 KB de rodapé.
  */
 function testarBusca() {
+  Logger.log('versão desta ponte: ' + VERSAO_PONTE +
+             '  (compare com o campo "ponte" do /saude)');
   Logger.log('busca: ' + busca_());
   var threads = GmailApp.search(busca_(), 0, 5);
   Logger.log(threads.length + ' conversa(s) encontrada(s)');
 
   if (!threads.length) {
     Logger.log(
-      'Nenhuma. Ou não chegou comprovante novo, ou o REMETENTE/ASSUNTO não ' +
-      'batem com o e-mail real, ou tudo já está etiquetado como "' +
-      ETIQUETA_ENVIADO + '" / "' + ETIQUETA_REVISAR + '".'
+      'Nenhuma. Ou não chegou e-mail novo do Nubank, ou o REMETENTE não bate ' +
+      'com o domínio real, ou tudo já está etiquetado como "' +
+      ETIQUETA_ENVIADO + '" / "' + ETIQUETA_REVISAR + '" / "' +
+      ETIQUETA_RUIDO + '".'
     );
     Logger.log(
       'Pra reprocessar um e-mail já etiquetado, remova a etiqueta dele no ' +
@@ -269,6 +336,10 @@ function testarBusca() {
   var corpo = texto_(msg);
   // Mesma abertura do servidor: cobre "um Pix de" e "uma transferência de".
   var recebeu = /voc[eê]\s+recebeu\s+(?:um\s+pix|uma\s+transfer[eê]ncia)\s+de/i;
+  var rotulo = /valor\s+recebido/i;
+  // Terceiro sinal do servidor: a cifra colada no carimbo de hora. Não é
+  // marcador da lista branca — sozinho ele só manda o e-mail pra revisão.
+  var cartao = /R\$\s*[\d.,]+\s*\d{1,2}\s+\w{3,}\s+[àa]s\s+\d{1,2}:\d{2}/i;
   var nome = corpo.match(
     /voc[eê]\s+recebeu\s+(?:um\s+pix|uma\s+transfer[eê]ncia)\s+de\s+(.{3,60}?)\s+e\s+o\s+valor\b/i
   );
@@ -277,18 +348,33 @@ function testarBusca() {
   );
   var valores = corpo.match(/R\$\s*[\d.,]+/g);
 
+  var m1 = recebeu.test(corpo);
+  var m2 = rotulo.test(corpo);
+
   Logger.log('===== VEREDITO =====');
   Logger.log('tamanho do corpo: ' + corpo.length + ' caracteres');
   Logger.log('marcador 1 "recebeu um Pix / uma transferência de": ' +
-             (recebeu.test(corpo) ? 'ACHOU' : 'NAO ACHOU'));
-  Logger.log('marcador 2 "Valor recebido": ' +
-             (/valor\s+recebido/i.test(corpo) ? 'ACHOU' : 'NAO ACHOU'));
+             (m1 ? 'ACHOU' : 'NAO ACHOU'));
+  Logger.log('marcador 2 "Valor recebido": ' + (m2 ? 'ACHOU' : 'NAO ACHOU'));
+  Logger.log('sinal 3 "R$ ... DD MMM às HH:MM": ' +
+             (cartao.test(corpo) ? 'ACHOU' : 'NAO ACHOU'));
   Logger.log('pagador: ' + (nome ? nome[1] : 'NAO ACHOU'));
   // O horario do proprio e-mail e a chave de dedup: sem ele, reenvio duplica.
   Logger.log('horário do e-mail (chave de dedup): ' +
              (quando ? quando[1] : 'NAO ACHOU'));
   Logger.log('valores R$ no texto: ' + (valores ? valores.join('  |  ') : 'nenhum'));
-  Logger.log('Os dois marcadores precisam dar ACHOU, senão o coletor ignora.');
+
+  if (m1 && m2) {
+    Logger.log('--> Vira Pix no painel. Etiqueta: ' + ETIQUETA_ENVIADO);
+  } else if (m1 || m2 || cartao.test(corpo)) {
+    Logger.log('--> NAO vira Pix, mas tem cara de comprovante. Etiqueta: ' +
+               ETIQUETA_REVISAR + '. Se ESTE e-mail for um Pix de verdade, ' +
+               'é aqui que o regex do app.py precisa de ajuste.');
+  } else {
+    Logger.log('--> Comunicação comum do Nubank. Etiqueta: ' + ETIQUETA_RUIDO +
+               '. Nada a fazer — a menos que seja um comprovante, e aí o ' +
+               'formato mudou por inteiro.');
+  }
   Logger.log('===== CORPO INTEIRO =====\n' + corpo);
 }
 
@@ -304,7 +390,8 @@ function testarEnvio() {
     Logger.log('nada novo pra enviar.');
     Logger.log(
       'Se você esperava um e-mail aqui, ele já está etiquetado: procure por ' +
-      'label:' + ETIQUETA_ENVIADO + ' ou label:' + ETIQUETA_REVISAR +
+      'label:' + ETIQUETA_ENVIADO + ', label:' + ETIQUETA_REVISAR + ' ou ' +
+      'label:' + ETIQUETA_RUIDO +
       ' no Gmail. Remover a etiqueta devolve o e-mail pra fila.'
     );
     return;
@@ -315,6 +402,10 @@ function testarEnvio() {
   if (status === 'ok') Logger.log('OK — o Pix tem que estar no painel agora.');
   else if (status === 'duplicado') Logger.log('Já estava lá. A dedup funcionou.');
   else if (status === 'erro') Logger.log('FALHOU — veja o erro acima.');
-  else Logger.log('O coletor respondeu "' + status + '": chegou no servidor, ' +
-                  'mas não virou Pix. O texto está no /brutos.');
+  else if (status === 'ignorado') Logger.log(
+    'Comunicação comum do Nubank — vai pra ' + ETIQUETA_RUIDO + '. O texto ' +
+    'dela não é guardado no servidor de propósito; só a contagem aparece no ' +
+    '/brutos.');
+  else Logger.log('O coletor respondeu "' + status + '": tem cara de ' +
+                  'comprovante e não foi lido. O texto está no /brutos.');
 }

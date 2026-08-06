@@ -1,10 +1,14 @@
 """
 Coletor de Pix — serviço independente.
 
-Recebe os e-mails de dinheiro recebido do Nubank — "Você recebeu uma
-transferência via Pix" e "Você recebeu uma transferência", que são formatos
-diferentes — de um Apps Script que lê o Gmail e posta o corpo aqui. Parseia,
-deduplica, grava em SQLite, empurra para o n8n e serve o dashboard.
+Recebe TUDO que o Nubank manda por e-mail — de um Apps Script que lê o Gmail e
+posta o corpo aqui — e é aqui, e só aqui, que se decide o que é dinheiro.
+Parseia, deduplica, grava em SQLite, empurra para o n8n e serve o dashboard.
+
+A ponte não filtra mais nada, e isso é a lição mais cara deste projeto: filtro
+do lado do Gmail descarta e-mail sem deixar rastro nenhum, e já escondeu dois
+comprovantes por causa de assunto que o banco mudou sem avisar. Aqui, o que não
+é reconhecido vira linha visível e recuperável. Ver `triagem` mais abaixo.
 
 Já passaram por aqui dois canais aposentados: notificação do app do Mercado
 Pago via MacroDroid no celular, e o e-mail do PicPay. Os parsers dos dois
@@ -24,6 +28,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from functools import wraps
+from html import escape
 
 import requests
 from flask import (
@@ -61,7 +66,7 @@ VALIDADE_BRUTOS_MIN = 15
 # Marcador de build — serve pra provar qual versão do código está rodando
 # no container. Bumpar a cada deploy que precise ser verificado.
 # TEMPORÁRIO: remover junto com /saude/headers quando o 401 estiver resolvido.
-VERSAO = "nubank-2"
+VERSAO = "nubank-3"
 
 
 # --------------------------------------------------------------------------
@@ -74,7 +79,7 @@ CREATE TABLE IF NOT EXISTS pix (
     valor_centavos  INTEGER,
     pagador         TEXT,
     texto_bruto     TEXT NOT NULL,
-    status          TEXT NOT NULL,          -- ok | sem_valor | ignorado
+    status          TEXT NOT NULL,          -- ok | sem_valor | suspeito | ignorado
     dedup_hash      TEXT NOT NULL UNIQUE,
     recebido_em     TEXT NOT NULL,
     conferido_em    TEXT,
@@ -85,7 +90,12 @@ CREATE INDEX IF NOT EXISTS idx_pix_status ON pix(status);
 
 CREATE TABLE IF NOT EXISTS heartbeat (
     origem      TEXT PRIMARY KEY,
-    ultimo_ping TEXT NOT NULL
+    ultimo_ping TEXT NOT NULL,
+    -- Versão que a ponte declarou na última vez que bateu aqui. Ver
+    -- VERSAO_PONTE no gmail-apps-script.gs: o arquivo é colado à mão dentro do
+    -- script.google.com, e sem isto não há como saber, de fora, se o que está
+    -- rodando lá é o mesmo código do repositório.
+    versao      TEXT
 );
 
 CREATE TABLE IF NOT EXISTS manutencao (
@@ -125,6 +135,12 @@ def init_db():
     # 2h, entao essa linha ficaria parada pra sempre no banco fingindo ser uma
     # ponte que ninguem mais alimenta.
     con.execute("DELETE FROM heartbeat WHERE origem = 'celular'")
+    # Banco que já existia não ganha a coluna pelo CREATE ... IF NOT EXISTS.
+    # Sem esta linha, o campo que prova a versão da ponte só apareceria em
+    # instalação nova — justo onde ele não faz falta.
+    if "versao" not in {c[1] for c in con.execute("PRAGMA table_info(heartbeat)")}:
+        con.execute("ALTER TABLE heartbeat ADD COLUMN versao TEXT")
+        log.info("heartbeat: coluna 'versao' adicionada")
     con.commit()
     con.close()
     log.info("banco pronto em %s", DB_PATH)
@@ -298,6 +314,68 @@ def e_nubank(bruto: str) -> bool:
     return bool(NUBANK_ABERTURA.search(bruto) and NUBANK_ROTULO_VALOR.search(bruto))
 
 
+# --------------------------------------------------------------------------
+# Triagem do que NÃO passou na lista branca
+#
+# A ponte não filtra mais por assunto. Um Pix de R$ 176 sumiu porque o Nubank
+# mandou a variante "transferência" com um assunto que não continha "Você
+# recebeu", e o filtro do Gmail engoliu o e-mail antes de qualquer código
+# olhar pra ele: sem etiqueta, sem /brutos, sem log. Agora TUDO que vem do
+# domínio do Nubank chega aqui — e a newsletter do banco vem junto.
+#
+# Se todo esse ruído caísse na mesma fila, `caixa-revisar` deixaria de
+# significar "o parser quebrou, vai lá consertar" e viraria uma segunda caixa
+# de entrada. No dia em que um comprovante de verdade caísse lá, ele sumiria
+# no meio da propaganda — o mesmo problema de antes, num lugar novo.
+#
+# Por isso o que não é comprovante vira dois status:
+#
+#   suspeito  -> cheira a comprovante. É o sinal de que o Nubank mexeu na
+#                redação. Vai pra `caixa-revisar` e você olha.
+#   ignorado  -> comunicação comum do banco. Vai pra `caixa-ruido` e ninguém
+#                olha.
+#
+# ISSO É TRIAGEM, NÃO PORTEIRO. Errar aqui não perde e-mail: os dois status
+# viram linha no /brutos, os dois ganham etiqueta no Gmail, e remover a
+# etiqueta devolve o e-mail pra fila na rodada seguinte. A garantia é "nada
+# desaparece"; acertar a gaveta é só conforto.
+# --------------------------------------------------------------------------
+
+# A assinatura do cartão de valor do comprovante: a cifra colada num carimbo
+# de hora ("R$ 176,00  06 AGO às 11:38"). Vale mais que os outros dois sinais
+# porque não depende de UMA PALAVRA SEQUER da redação — se o Nubank reescrever
+# o e-mail inteiro e só mantiver o cartãozinho cinza, este ainda acusa.
+NUBANK_CARTAO_VALOR = re.compile(
+    r"R\$\s*[\d.,]+\s*\d{1,2}\s+\w{3,}\s+[àa]s\s+\d{1,2}:\d{2}", re.I
+)
+
+# Um sinal já basta pra mandar pra revisão. O limite é frouxo de propósito: os
+# três são específicos o bastante pra propaganda não acertar nenhum por acaso,
+# e o custo de um falso positivo é um e-mail a mais numa fila que você já olha.
+SINAIS_COMPROVANTE = (NUBANK_ABERTURA, NUBANK_ROTULO_VALOR, NUBANK_CARTAO_VALOR)
+
+
+def triagem(bruto: str) -> str:
+    return "suspeito" if any(s.search(bruto) for s in SINAIS_COMPROVANTE) else "ignorado"
+
+
+# O que entra como `ignorado` é gravado SEM O TEXTO.
+#
+# A rede larga trouxe a correspondência inteira do banco pra dentro do
+# servidor: fatura, limite, extrato, proposta de empréstimo. Nada disso tem a
+# ver com Pix recebido, e o funcionário não tem por que esbarrar nisso — o
+# /brutos tem link no rodapé do painel, e senha errada um dia é senha vazada
+# outro dia. Texto que não é guardado não vaza.
+#
+# O que se perde: se um comprovante for classificado como ruído (formato
+# reescrito por inteiro, sem acertar nenhum dos três sinais), o texto dele não
+# estará no /brutos. Ele continua inteiro no Gmail, sob `label:caixa-ruido`, e
+# remover a etiqueta o devolve pra fila — que é o caminho de recuperação de
+# verdade. O /brutos sempre foi conveniência pra calibrar regex, nunca o lugar
+# onde o e-mail se salva.
+TEXTO_NAO_GUARDADO = "(comunicação comum do Nubank — texto não guardado)"
+
+
 def parse(bruto: str):
     """Retorna (centavos, pagador, status, quando).
 
@@ -306,7 +384,7 @@ def parse(bruto: str):
     criaria um jeito novo de falhar.
     """
     if not e_nubank(bruto):
-        return None, None, "ignorado", None
+        return None, None, triagem(bruto), None
 
     mq = NUBANK_QUANDO_RE.search(bruto)
     quando = " ".join(mq.group("quando").split()) if mq else None
@@ -375,11 +453,20 @@ def extrair_texto() -> str:
 
 
 def registrar_ping(origem=ORIGEM_PONTE):
+    # A ponte declara a versão dela na querystring. Fica gravada pra o /saude
+    # conseguir responder "o código que está rodando no Google é o mesmo do
+    # repositório?" — pergunta que já ficou sem resposta por meses e custou um
+    # Pix. Ver VERSAO_PONTE no gmail-apps-script.gs.
+    versao = (request.args.get("ponte") or "")[:40] or None
     db = get_db()
     db.execute(
-        """INSERT INTO heartbeat (origem, ultimo_ping) VALUES (?, ?)
-           ON CONFLICT(origem) DO UPDATE SET ultimo_ping = excluded.ultimo_ping""",
-        (origem, datetime.now(TZ).isoformat()),
+        """INSERT INTO heartbeat (origem, ultimo_ping, versao) VALUES (?, ?, ?)
+           ON CONFLICT(origem) DO UPDATE SET
+               ultimo_ping = excluded.ultimo_ping,
+               -- COALESCE pra uma ponte antiga, que não manda versão nenhuma,
+               -- não apagar o que a nova já tinha declarado.
+               versao = COALESCE(excluded.versao, heartbeat.versao)""",
+        (origem, datetime.now(TZ).isoformat(), versao),
     )
     db.commit()
 
@@ -416,25 +503,52 @@ def ingest_pix():
         chave = f"raw|{texto}"
     dedup = hashlib.sha256(chave.encode("utf-8")).hexdigest()
 
+    # A chave de dedup acima foi calculada com o texto INTEIRO; o que muda aqui
+    # é só o que fica gravado. Guardar menos não faz o mesmo e-mail entrar duas
+    # vezes.
+    guardado = TEXTO_NAO_GUARDADO if status == "ignorado" else texto[:4000]
+
     db = get_db()
     try:
         cur = db.execute(
             """INSERT INTO pix (valor_centavos, pagador, texto_bruto, status,
                                 dedup_hash, recebido_em)
                VALUES (?, ?, ?, ?, ?, ?)""",
-            (centavos, pagador, texto[:4000], status, dedup, agora.isoformat()),
+            (centavos, pagador, guardado, status, dedup, agora.isoformat()),
         )
         db.commit()
         novo_id = cur.lastrowid
     except sqlite3.IntegrityError:
+        # Duplicado também prova que a ponte está viva.
+        registrar_ping()
+
+        # Devolve o status que a linha JÁ TEM, e não um "duplicado" genérico.
+        #
+        # A diferença é a que faz o reprocessamento funcionar. O jeito de
+        # reprocessar um e-mail é remover a etiqueta dele no Gmail; a ponte
+        # reenvia, e o texto é idêntico, então a chave de dedup bate e cai
+        # aqui. Respondendo "duplicado", a ponte etiquetava como
+        # `caixa-enviado` — ou seja, você tirava a etiqueta pra reprocessar
+        # depois de mexer no regex, o regex ainda não pegava, e o e-mail era
+        # marcado como RESOLVIDO. Sumia da fila sem nunca ter virado Pix.
+        #
+        # Com o status real de volta, um e-mail que continua sem ser
+        # reconhecido continua na fila de revisão, quantas vezes for preciso.
+        linha = db.execute(
+            "SELECT status FROM pix WHERE dedup_hash = ?", (dedup,)
+        ).fetchone()
+        anterior = linha["status"] if linha else "ok"
+
+        if anterior != "ok":
+            log.info("reenvio de e-mail %s — continua fora do painel", anterior)
+            return jsonify(status=anterior, duplicado=True), 200
+
         # Sem identificador de transação, "duplicado" é um palpite: quase sempre
         # é o mesmo e-mail reenviado, mas pode ser um Pix real do mesmo pagador,
         # mesmo valor e mesmo minuto sendo descartado. Fica no log com valor e
         # nome pra dar o que conferir quando o fechamento não bater — é o único
         # rastro que esse caso deixa.
         log.warning("duplicado descartado | %s | %s | %s", centavos, pagador, quando)
-        # Duplicado também prova que a ponte está viva.
-        registrar_ping()
         return jsonify(status="duplicado"), 200
 
     # O relógio do painel anda a cada e-mail que chega, e só. Não existe ping
@@ -513,6 +627,17 @@ def painel():
 def api_pix():
     limite = (datetime.now(TZ) - timedelta(hours=24)).isoformat()
     db = get_db()
+    # LISTA DE PERMISSÃO, não lista de exclusão — e agora ela é a fronteira que
+    # separa o funcionário da correspondência do banco.
+    #
+    # Só `ok` (Pix lido) e `sem_valor` (comprovante reconhecido cujo valor não
+    # foi lido) chegam na tela. `suspeito` e `ignorado` ficam de fora: desde que
+    # a ponte parou de filtrar por assunto, é por eles que entra tudo que o
+    # Nubank manda e não é Pix recebido.
+    #
+    # Se um dia isto virar `status <> 'algo'`, fatura e proposta de empréstimo
+    # aparecem no balcão. Status novo tem que ser adicionado aqui de propósito,
+    # nunca herdar a vaga por descuido.
     linhas = db.execute(
         """SELECT id, valor_centavos, pagador, status, recebido_em, conferido_em
            FROM pix
@@ -598,23 +723,59 @@ def brutos():
         )
 
     db = get_db()
+    # `ignorado` fica de fora: é a comunicação comum do banco, e o texto dela
+    # nem foi gravado (veja TEXTO_NAO_GUARDADO). Listar dezenas dessas linhas
+    # empurraria o `suspeito` de verdade pra fora do LIMIT 50 — e esta página
+    # existe justamente pra ele ser encontrado. Sobra a contagem, que é o que
+    # importa saber: se ela disparar num dia sem Pix, a triagem é que errou.
     linhas = db.execute(
         """SELECT id, status, recebido_em, texto_bruto FROM pix
-           WHERE status <> 'ok' ORDER BY id DESC LIMIT 50"""
+           WHERE status NOT IN ('ok', 'ignorado')
+           ORDER BY id DESC LIMIT 50"""
     ).fetchall()
+    ruido = db.execute(
+        "SELECT COUNT(*) FROM pix WHERE status = 'ignorado'"
+    ).fetchone()[0]
+
     corpo = "\n\n".join(
         f"--- #{l['id']} | {l['status']} | {l['recebido_em']} ---\n{l['texto_bruto']}"
         for l in linhas
     ) or "Nada pendente."
+    corpo += (
+        f"\n\n--- {ruido} comunicação(ões) comum(ns) do Nubank no período ---\n"
+        "Texto não guardado. Se alguma delas for um comprovante, ela está "
+        "inteira no Gmail em label:caixa-ruido — remova a etiqueta e a ponte "
+        "reprocessa."
+    )
+    # escape() porque o texto vem de e-mail: o corpo é escolhido por quem
+    # manda, e cair cru dentro do HTML deixaria um <script> de remetente
+    # qualquer rodar nesta página.
     return (
         "<pre style='white-space:pre-wrap;padding:24px;background:#111418;"
-        f"color:#fff;min-height:100vh;margin:0;font:13px/1.6 monospace'>{corpo}</pre>"
+        f"color:#fff;min-height:100vh;margin:0;font:13px/1.6 monospace'>"
+        f"{escape(corpo)}</pre>"
     )
 
 
 @app.get("/saude")
 def saude():
-    return jsonify(ok=True, hora=datetime.now(TZ).isoformat(), versao=VERSAO)
+    """`versao` é o servidor; `ponte` é o que o Apps Script declarou na última
+    vez que mandou um e-mail. São dois códigos com ciclos de vida separados: um
+    sobe por deploy, o outro por copiar e colar dentro do script.google.com. Ver
+    os dois lado a lado é o jeito de flagrar que um ficou pra trás."""
+    con = sqlite3.connect(DB_PATH, timeout=10)
+    try:
+        linha = con.execute(
+            "SELECT versao FROM heartbeat WHERE origem = ?", (ORIGEM_PONTE,)
+        ).fetchone()
+    finally:
+        con.close()
+    return jsonify(
+        ok=True,
+        hora=datetime.now(TZ).isoformat(),
+        versao=VERSAO,
+        ponte=(linha[0] if linha else None),
+    )
 
 
 # TEMPORÁRIO — diagnóstico do 401 atrás do Traefik.
