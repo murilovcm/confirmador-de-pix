@@ -181,17 +181,26 @@ O log abre com a versão da ponte e um **VEREDITO** que diz onde aquele e-mail
 vai parar:
 
 ```
-versão desta ponte: ponte-3  (compare com o campo "ponte" do /saude)
+versão desta ponte: ponte-4  (compare com o campo "ponte" do /saude)
 marcador 1 "recebeu um Pix / uma transferência de": ACHOU
 marcador 2 "Valor recebido": ACHOU
 sinal 3 "R$ ... DD MMM às HH:MM": ACHOU
 pagador: MATHEUS SANTANA CANEJO
+valor que o servidor vai ler: R$ 12,34  (pelo rótulo)
 horário do e-mail (chave de dedup): 05 AGO às 18:51
---> Vira Pix no painel. Etiqueta: caixa-enviado
+--> Vira Pix de R$ 12,34 no painel. Etiqueta: caixa-enviado
 ```
 
-Os **dois marcadores precisam dar ACHOU** pra virar dinheiro. O horário também:
-é ele que segura a dedup, como explicado na seção 9.
+Os **dois marcadores precisam dar ACHOU** pra passar na lista branca — mas
+passar na lista branca não é virar dinheiro. Quem decide isso é a linha
+**`valor que o servidor vai ler`**: se ela disser `NAO ACHOU`, o comprovante
+entra no painel como "Valor não lido" e vai pra `caixa-revisar`.
+
+Essa linha existe por causa do 31/08/2026: os dois marcadores davam ACHOU, o
+veredito dizia "vira Pix", e o painel mostrava quatro "Valor não lido". O
+diagnóstico não tinha como mostrar a diferença — agora tem.
+
+O horário também importa: é ele que segura a dedup, como explicado na seção 9.
 
 Como a busca agora pega tudo do Nubank, é normal o `testarBusca` cair numa
 newsletter e responder `--> Comunicação comum do Nubank`. Não é defeito — é a
@@ -264,8 +273,8 @@ O arquivo colado é o mesmo. As etiquetas `caixa-enviado`, `caixa-revisar` e
 Depois de rodar o `testarEnvio` lá, o `/saude` prova que chegou:
 
 ```json
-{ "versao": "duas-origens-1",
-  "pontes": { "murilo-vaporstore": "ponte-3", "matheus-royal-podsilha": "ponte-3" } }
+{ "versao": "brand-refresh-1",
+  "pontes": { "murilo-vaporstore": "ponte-4", "matheus-royal-podsilha": "ponte-4" } }
 ```
 
 `null` numa ponte quer dizer "nunca mandou nada" — ou não foi instalada, ou o
@@ -609,6 +618,42 @@ própria como no PicPay. O valor sai de `valor recebido`, nunca do primeiro `R$`
 do texto (que pode ser promoção). Se o rótulo faltar, vira `sem_valor` e cai no
 `/brutos` com o texto inteiro, pro regex se ajustar com o caso real na mão.
 
+#### O asterisco do negrito — 31/08/2026
+
+Em 31/08/2026, às 15:44, o Nubank trocou o template (os assets passaram a vir
+de `cdn.nubank.com.br/core-marketing/emails-brand-refresh-2026/…`) e o rótulo
+virou **negrito**:
+
+```html
+<strong>Valor recebido:</strong><br>R$ 157,99<br>31 AGO às 17:31
+```
+
+O Gmail achata negrito como `*texto*` no corpo em texto puro que a ponte
+manda. O asterisco caiu exatamente entre o rótulo e a cifra, o regex do valor
+exigia só espaço e dois-pontos ali, e **quatro comprovantes apareceram como
+"Valor não lido"** — o dinheiro não sumiu (a lista branca continuou passando),
+mas o caixa não sabia de quanto era.
+
+A leitura do valor passou a ter duas camadas:
+
+1. **Pelo rótulo** (`NUBANK_VALOR_RE`) — continua ancorado em `valor recebido`,
+   mas agora atravessa ruído de **formatação** até a cifra: `*`, `_`, `:`,
+   travessão, bullet, quebra de linha e invisíveis (`nbsp`, `zwsp`, `zwnj`,
+   word-joiner). A classe **não tem letra nem dígito**, e isso é o ponto: ela
+   trava na primeira palavra de verdade, então um `Valor recebido: tarifa de
+   R$ 5,00` **não** vira dinheiro.
+
+2. **Pelo cartão de valor** (`NUBANK_CARTAO_VALOR`), só se a primeira falhar —
+   a cifra colada no carimbo de hora (`R$ 157,99  31 AGO às 17:31`), procurada
+   **somente depois** do rótulo. Esse par não depende de uma palavra sequer da
+   redação, então sobrevive a uma reescrita inteira do e-mail; e limitá-lo ao
+   trecho posterior ao rótulo é o que impede um `R$` de rodapé ou de promoção
+   de virar recebimento.
+
+Valor e horário saem do **mesmo match**, nos dois caminhos. Separados, uma
+próxima mexida do Nubank poderia quebrar só um dos dois e o painel mostraria
+valor certo com horário de outro e-mail — e o horário é a chave de dedup.
+
 ### Dedup: não existe identificador de transação
 
 **O e-mail do Nubank não traz nenhum ID de transação.** Foi procurado no fonte
@@ -664,8 +709,8 @@ Se você mexeu no `.gs` em vez do `app.py`, o passo 4 é outro: colar o arquivo 
 `/saude` devolve campos de **códigos diferentes**:
 
 ```json
-{ "versao": "duas-origens-1",
-  "pontes": { "murilo-vaporstore": "ponte-3", "matheus-royal-podsilha": "ponte-3" } }
+{ "versao": "brand-refresh-1",
+  "pontes": { "murilo-vaporstore": "ponte-4", "matheus-royal-podsilha": "ponte-4" } }
 ```
 
 `versao` é o servidor, que sobe por deploy. Cada entrada de `pontes` é o

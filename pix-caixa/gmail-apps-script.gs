@@ -80,7 +80,7 @@ var ETIQUETA_RUIDO = 'caixa-ruido';
 // os dois lado a lado. Se `ponte` no /saude não bater com o valor daqui, o que
 // está rodando no Google é código velho — e é aí que se olha primeiro quando
 // um comprovante sumir.
-var VERSAO_PONTE = 'ponte-3';
+var VERSAO_PONTE = 'ponte-4';
 
 // Teto por rodada. Um pico de e-mail não pode fazer uma execução estourar o
 // tempo e ser morta no meio: o que sobrar vai na próxima, um minuto depois.
@@ -343,9 +343,20 @@ function testarBusca() {
   var nome = corpo.match(
     /voc[eê]\s+recebeu\s+(?:um\s+pix|uma\s+transfer[eê]ncia)\s+de\s+(.{3,60}?)\s+e\s+o\s+valor\b/i
   );
-  var quando = corpo.match(
-    /valor\s+recebido\s*:?\s*R\$\s*[\d.,]+\s*(\d{1,2}\s+\w{3,}\s+[àa]s\s+\d{1,2}:\d{2})/i
+  // Espelho do NUBANK_VALOR_RE do servidor. A classe do meio é ruído de
+  // FORMATAÇÃO (asterisco, dois-pontos, invisível, quebra de linha) e não tem
+  // letra nem dígito de propósito — foi o asterisco do <strong> do template
+  // `emails-brand-refresh-2026` que derrubou a leitura em 31/08.
+  var pago = corpo.match(
+    /valor\s+recebido\b[\s:*_.\-–—|•\u00a0\u200b\u200c\u2060]{0,40}R\$\s*(\d[\d.]*(?:,\d{1,2})?)(?:\s*(\d{1,2}\s+\w{3,}\s+[àa]s\s+\d{1,2}:\d{2}))?/i
   );
+  // Fallback do servidor: o cartão de valor, mas só o que vier DEPOIS do
+  // rótulo. Se `pago` falhar e este achar, o servidor ainda lê o Pix.
+  var resto = corpo.split(/valor\s+recebido/i).slice(1).join(' ');
+  var pagoCartao = resto.match(
+    /R\$\s*(\d[\d.]*(?:,\d{1,2})?)\s*(\d{1,2}\s+\w{3,}\s+[àa]s\s+\d{1,2}:\d{2})/i
+  );
+  var lido = pago || pagoCartao;
   var valores = corpo.match(/R\$\s*[\d.,]+/g);
 
   var m1 = recebeu.test(corpo);
@@ -359,13 +370,26 @@ function testarBusca() {
   Logger.log('sinal 3 "R$ ... DD MMM às HH:MM": ' +
              (cartao.test(corpo) ? 'ACHOU' : 'NAO ACHOU'));
   Logger.log('pagador: ' + (nome ? nome[1] : 'NAO ACHOU'));
+  Logger.log('valor que o servidor vai ler: ' +
+             (lido ? 'R$ ' + lido[1] + (pago ? '  (pelo rótulo)' : '  (pelo cartão)')
+                   : 'NAO ACHOU  <-- vira "Valor não lido" no painel'));
   // O horario do proprio e-mail e a chave de dedup: sem ele, reenvio duplica.
   Logger.log('horário do e-mail (chave de dedup): ' +
-             (quando ? quando[1] : 'NAO ACHOU'));
+             (lido && lido[2] ? lido[2] : 'NAO ACHOU'));
   Logger.log('valores R$ no texto: ' + (valores ? valores.join('  |  ') : 'nenhum'));
 
-  if (m1 && m2) {
-    Logger.log('--> Vira Pix no painel. Etiqueta: ' + ETIQUETA_ENVIADO);
+  // Passar na lista branca NÃO é o mesmo que virar dinheiro no painel, e
+  // confundir os dois foi o que atrasou o diagnóstico em 31/08: os dois
+  // marcadores casavam, o veredito aqui dizia "vira Pix", e no painel os
+  // comprovantes apareciam como "Valor não lido" porque o VALOR não era lido.
+  if (m1 && m2 && lido) {
+    Logger.log('--> Vira Pix de R$ ' + lido[1] + ' no painel. Etiqueta: ' +
+               ETIQUETA_ENVIADO);
+  } else if (m1 && m2) {
+    Logger.log('--> Passa na lista branca MAS o valor não é lido: entra como ' +
+               '"Valor não lido" no painel e vai pra ' + ETIQUETA_REVISAR +
+               '. É o NUBANK_VALOR_RE do app.py que precisa de ajuste — olhe o ' +
+               'que tem entre "Valor recebido" e "R$" no corpo abaixo.');
   } else if (m1 || m2 || cartao.test(corpo)) {
     Logger.log('--> NAO vira Pix, mas tem cara de comprovante. Etiqueta: ' +
                ETIQUETA_REVISAR + '. Se ESTE e-mail for um Pix de verdade, ' +

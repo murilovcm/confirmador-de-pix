@@ -105,7 +105,7 @@ VALIDADE_BRUTOS_MIN = 15
 # Marcador de build — serve pra provar qual versão do código está rodando
 # no container. Bumpar a cada deploy que precise ser verificado.
 # TEMPORÁRIO: remover junto com /saude/headers quando o 401 estiver resolvido.
-VERSAO = "duas-origens-1"
+VERSAO = "brand-refresh-1"
 
 
 # --------------------------------------------------------------------------
@@ -289,7 +289,7 @@ def para_centavos(t: str) -> int:
 
 
 def limpar_nome(n: str):
-    n = " ".join(n.split()).strip(" -–—:.,")
+    n = " ".join(n.split()).strip(" -–—:.,*_")
     n = re.sub(r"^[\d.\-]+\s*", "", n)          # remove CPF mascarado colado
     if len(n) < 3 or LIXO_NOME.match(n):
         return None
@@ -356,18 +356,67 @@ NUBANK_NOME_RES = [
     ),
 ]
 
-NUBANK_VALOR_RE = re.compile(
-    r"valor\s+recebido\s*:?\s*R\$\s*(?P<valor>\d[\d.]*(?:,\d{1,2})?)", re.I
-)
+# Ruído de FORMATAÇÃO entre o rótulo e a cifra. Custou os Pix do dia 31/08.
+#
+# O rótulo virou "<strong>Valor recebido:</strong><br>R$ 157,99" no template
+# `emails-brand-refresh-2026`, e o Gmail achata negrito como *texto* no corpo
+# em texto puro que a ponte manda. O asterisco caiu bem no meio de
+# `recebido\s*:?\s*R\$`, o valor parou de ser lido, e quatro comprovantes
+# viraram "Valor não lido" no painel.
+#
+# A classe abaixo NÃO CONTÉM LETRA NEM DÍGITO, e isso é o ponto: ela pula
+# decoração ("*", "_", ":", travessão, bullet, invisível, quebra de linha) e
+# trava na primeira palavra de verdade. Um "Valor recebido: tarifa de R$ 5,00"
+# não passa — que é o motivo de este parser nunca ter caído no primeiro "R$"
+# solto do texto.
+_RUIDO_FORMATO = r"[\s:*_.\-–—|•\u00a0\u200b\u200c\u2060]"
 
-# O horário que o PRÓPRIO e-mail declara ("05 AGO às 18:51"), ancorado logo
-# depois do valor pra não casar com data de rodapé. Ele é a peça que faz a
-# dedup sobreviver a reenvio: veja ingest_pix.
-NUBANK_QUANDO_RE = re.compile(
-    r"valor\s+recebido\s*:?\s*R\$\s*[\d.,]+\s*"
-    r"(?P<quando>\d{1,2}\s+\w{3,}\s+[àa]s\s+\d{1,2}:\d{2})",
+# O carimbo de hora que o PRÓPRIO e-mail declara ("05 AGO às 18:51"). É a chave
+# que faz a dedup sobreviver a reenvio (veja ingest_pix), e sai do MESMO match
+# do valor: separado, um dia o Nubank quebraria só um dos dois e o painel
+# mostraria valor certo com horário de outro e-mail.
+_CARIMBO = r"\d{1,2}\s+\w{3,}\s+[àa]s\s+\d{1,2}:\d{2}"
+
+# Caminho principal: ancorado no rótulo, que é o que garante que este R$ é o do
+# comprovante e não o de uma promoção. O carimbo é opcional aqui — se o Nubank
+# tirar a hora, perde-se a dedup forte, não o dinheiro.
+NUBANK_VALOR_RE = re.compile(
+    r"valor\s+recebido\b" + _RUIDO_FORMATO + r"{0,40}"
+    r"R\$\s*(?P<valor>\d[\d.]*(?:,\d{1,2})?)"
+    r"(?:\s*(?P<quando>" + _CARIMBO + r"))?",
     re.I,
 )
+
+# A assinatura do cartão de valor: a cifra COLADA no carimbo de hora
+# ("R$ 176,00  06 AGO às 11:38"). Vale mais que qualquer outro sinal porque não
+# depende de UMA PALAVRA SEQUER da redação — se o Nubank reescrever o e-mail
+# inteiro e só mantiver o cartãozinho, este ainda acha o valor.
+#
+# Serve a dois donos: é o fallback do parser (só o que vier DEPOIS do rótulo,
+# veja ler_valor) e é um dos SINAIS_COMPROVANTE da triagem lá embaixo.
+NUBANK_CARTAO_VALOR = re.compile(
+    r"R\$\s*(?P<valor>\d[\d.]*(?:,\d{1,2})?)\s*(?P<quando>" + _CARIMBO + r")",
+    re.I,
+)
+
+
+def ler_valor(bruto: str):
+    """Devolve (centavos, quando) do comprovante, ou (None, None).
+
+    Duas camadas, e a ordem importa: primeiro o rótulo, que é específico;
+    o cartão só entra quando o rótulo falha, e mesmo assim SÓ A PARTIR do
+    rótulo. Buscar o cartão no texto inteiro deixaria um R$ de rodapé ou de
+    propaganda virar dinheiro — é justamente o que este parser nunca fez.
+    """
+    m = NUBANK_VALOR_RE.search(bruto)
+    if not m:
+        rotulo = NUBANK_ROTULO_VALOR.search(bruto)
+        if rotulo:
+            m = NUBANK_CARTAO_VALOR.search(bruto, rotulo.end())
+    if not m:
+        return None, None
+    quando = m.group("quando")
+    return para_centavos(m.group("valor")), " ".join(quando.split()) if quando else None
 
 
 def e_nubank(bruto: str) -> bool:
@@ -404,13 +453,9 @@ def e_nubank(bruto: str) -> bool:
 # desaparece"; acertar a gaveta é só conforto.
 # --------------------------------------------------------------------------
 
-# A assinatura do cartão de valor do comprovante: a cifra colada num carimbo
-# de hora ("R$ 176,00  06 AGO às 11:38"). Vale mais que os outros dois sinais
-# porque não depende de UMA PALAVRA SEQUER da redação — se o Nubank reescrever
-# o e-mail inteiro e só mantiver o cartãozinho cinza, este ainda acusa.
-NUBANK_CARTAO_VALOR = re.compile(
-    r"R\$\s*[\d.,]+\s*\d{1,2}\s+\w{3,}\s+[àa]s\s+\d{1,2}:\d{2}", re.I
-)
+# NUBANK_CARTAO_VALOR está definido lá em cima, junto do parser: desde que ele
+# virou também o fallback de leitura do valor, uma segunda cópia aqui seria um
+# jeito de consertar um e esquecer o outro.
 
 # Um sinal já basta pra mandar pra revisão. O limite é frouxo de propósito: os
 # três são específicos o bastante pra propaganda não acertar nenhum por acaso,
@@ -449,14 +494,11 @@ def parse(bruto: str):
     if not e_nubank(bruto):
         return None, None, triagem(bruto), None
 
-    mq = NUBANK_QUANDO_RE.search(bruto)
-    quando = " ".join(mq.group("quando").split()) if mq else None
-
-    mv = NUBANK_VALOR_RE.search(bruto)
-    if not mv:
-        # Sem fallback pro primeiro "R$" solto do texto, de propósito: ele pode
-        # ser tarifa ou promoção. Vira sem_valor, cai no /brutos com o texto
-        # inteiro e o regex se ajusta com o caso real na mão.
+    centavos, quando = ler_valor(bruto)
+    if centavos is None:
+        # Continua sem fallback pro primeiro "R$" solto do texto, de propósito:
+        # ele pode ser tarifa ou promoção. Vira sem_valor, cai no /brutos com o
+        # texto inteiro e o regex se ajusta com o caso real na mão.
         return None, None, "sem_valor", quando
 
     nome = None
@@ -467,7 +509,7 @@ def parse(bruto: str):
             if nome:
                 break
 
-    return para_centavos(mv.group("valor")), nome, "ok", quando
+    return centavos, nome, "ok", quando
 
 
 # --------------------------------------------------------------------------
